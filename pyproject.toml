@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coldstart"
+version = "0.1.0"
+description = "Reference cold-start recommender components"
+authors = [{name = "Cold Start Authors"}]
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+cli = []
+
+[project.urls]
+Homepage = "https://example.com/coldstart"
