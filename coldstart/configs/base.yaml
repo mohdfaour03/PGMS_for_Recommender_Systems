@@ -1,0 +1,12 @@
+tfidf:
+  max_features: 128
+  min_df: 1
+  ngram_range: [1, 2]
+mf:
+  reg: 0.02
+  iters: 30
+  lr: 0.02
+ctrlite:
+  reg: 0.01
+  lr: 0.1
+  iters: 80
