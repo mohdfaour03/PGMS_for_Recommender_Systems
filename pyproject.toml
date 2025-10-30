@@ -8,7 +8,12 @@ version = "0.1.0"
 description = "Reference cold-start recommender components"
 authors = [{name = "Cold Start Authors"}]
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "numpy>=1.23",
+    "pandas>=1.5",
+    "requests>=2.31",
+    "torch>=2.0",
+]
 
 [project.optional-dependencies]
 cli = []

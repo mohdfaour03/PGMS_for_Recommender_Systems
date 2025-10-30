@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+coldstart/output/
+coldstart/data/movielens_latest_small.csv

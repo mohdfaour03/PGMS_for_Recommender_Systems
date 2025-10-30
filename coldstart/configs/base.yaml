@@ -2,6 +2,8 @@ tfidf:
   max_features: 128
   min_df: 1
   ngram_range: [1, 2]
+prepare:
+  interaction_limit: 1200000
 mf:
   reg: 0.02
   iters: 30
@@ -10,3 +12,28 @@ ctrlite:
   reg: 0.01
   lr: 0.1
   iters: 80
+a2f:
+  hidden_dim: 128
+  lr: 0.01
+  reg: 0.0001
+  iters: 200
+  batch_size: 512
+ctpf:
+  topics: 80
+  nmf_iters: 200
+  reg: 0.1
+  projection_iters: 120
+cdl:
+  hidden_dim: 256
+  lr: 0.005
+  reg: 0.0001
+  map_reg: 0.01
+  iters: 300
+  batch_size: 256
+  corruption: 0.2
+hft:
+  topics: 80
+  nmf_iters: 200
+  kappa: 1.0
+  reg: 0.05
+  projection_iters: 120

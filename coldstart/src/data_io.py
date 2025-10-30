@@ -19,7 +19,7 @@ def _ensure_required_columns(row: Dict[str, Any]) -> None:
         raise DataFormatError(f"Missing required columns: {missing}")
 
 
-def load_interactions(path: str | Path) -> List[Dict[str, Any]]:
+def load_interactions(path: str | Path, limit: int | None = None) -> List[Dict[str, Any]]:
     """Load interactions from a CSV file.
 
     Parameters
@@ -35,6 +35,9 @@ def load_interactions(path: str | Path) -> List[Dict[str, Any]]:
             " reference implementation."
         )
 
+    if limit is not None and limit <= 0:
+        raise ValueError("limit must be positive when provided.")
+
     with path.open("r", newline="", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)
         rows: List[Dict[str, Any]] = []
@@ -47,6 +50,8 @@ def load_interactions(path: str | Path) -> List[Dict[str, Any]]:
                 "item_text": row["item_text"],
             }
             rows.append(parsed)
+            if limit is not None and len(rows) >= limit:
+                break
     print(f"Loaded {len(rows)} interactions from {path}.")
     if rows:
         n_users = len({row["user_id"] for row in rows})
