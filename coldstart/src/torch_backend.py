@@ -355,7 +355,7 @@ def train_ctpf(
 
     for _ in range(nmf_iters):
         WH = W @ H + eps
-        ratio = (X / WH).matmul(H.transpose(1, 0))
+        ratio = torch.matmul(X / WH, H.transpose(1, 0))
         W = W * ratio
         W = W.clamp_min(eps)
         W = W / W.sum(dim=1, keepdim=True).clamp_min(eps)
@@ -385,7 +385,7 @@ def project_topics(
     n_items = X.shape[0]
     topics = H.shape[0]
     W = torch.rand((n_items, topics), device=device) + eps
-    HT = H.T
+    HT = H.transpose(1, 0)
 
     for _ in range(iters):
         WH = W @ H
@@ -406,6 +406,8 @@ def infer_ctpf(
 ) -> List[List[float]]:
     W = project_topics(cold_features, params["topic_components"], projection_iters, seed, prefer_gpu)
     topic_to_factor = params["topic_to_factor"].to(W.device)
+    if topic_to_factor.shape[0] != W.shape[1]:
+        topic_to_factor = topic_to_factor.T
     factors = W @ topic_to_factor
     return factors.cpu().numpy().tolist()
 
