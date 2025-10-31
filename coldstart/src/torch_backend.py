@@ -355,7 +355,8 @@ def train_ctpf(
 
     for _ in range(nmf_iters):
         WH = W @ H + eps
-        W = W * (X / WH) @ H.T
+        ratio = (X / WH).matmul(H.transpose(1, 0))
+        W = W * ratio
         W = W.clamp_min(eps)
         W = W / W.sum(dim=1, keepdim=True).clamp_min(eps)
         WH = W @ H + eps
@@ -388,8 +389,8 @@ def project_topics(
 
     for _ in range(iters):
         WH = W @ H
-        numerator = X @ HT
-        denominator = WH @ HT + eps
+        numerator = torch.matmul(X, HT)
+        denominator = torch.matmul(WH, HT) + eps
         W = W * (numerator / denominator.clamp_min(eps))
         W = W.clamp_min(eps)
         W = W / W.sum(dim=1, keepdim=True).clamp_min(eps)
