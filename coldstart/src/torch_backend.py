@@ -405,7 +405,7 @@ def infer_ctpf(
     prefer_gpu: bool,
 ) -> List[List[float]]:
     W = project_topics(cold_features, params["topic_components"], projection_iters, seed, prefer_gpu)
-    topic_to_factor = params["topic_to_factor"].T.to(W.device)
+    topic_to_factor = params["topic_to_factor"].to(W.device)
     factors = W @ topic_to_factor
     return factors.cpu().numpy().tolist()
 
