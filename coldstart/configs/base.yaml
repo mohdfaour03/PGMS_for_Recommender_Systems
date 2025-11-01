@@ -37,3 +37,10 @@ hft:
   kappa: 1.0
   reg: 0.05
   projection_iters: 120
+micm:
+  lr: 0.001
+  reg: 0.0001
+  iters: 200
+  batch_size: 1024
+  temperature: 0.07
+  symmetric: true

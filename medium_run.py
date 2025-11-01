@@ -42,6 +42,7 @@ metrics = pipeline.train_and_evaluate_content_model(
     ctpf_cfg=config.get("ctpf", {}),
     cdl_cfg=config.get("cdl", {}),
     hft_cfg=config.get("hft", {}),
+    micm_cfg=config.get("micm", {}),
     backend="torch",
     prefer_gpu=True,
     mf_cfg={

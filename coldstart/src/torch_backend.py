@@ -258,6 +258,89 @@ def infer_a2f(
     return outputs
 
 
+class MICMModel(nn.Module):
+    def __init__(self, n_features: int, n_factors: int) -> None:
+        super().__init__()
+        self.proj = nn.Linear(n_features, n_factors, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x)
+
+
+@dataclass
+class MICMConfig:
+    lr: float = 1e-3
+    reg: float = 1e-4
+    iters: int = 200
+    batch_size: int = 1024
+    temperature: float = 0.07
+    symmetric: bool = True
+
+
+def _info_nce_loss(
+    projected: torch.Tensor, targets: torch.Tensor, temperature: float, symmetric: bool
+) -> torch.Tensor:
+    projected = torch.nn.functional.normalize(projected, dim=1)
+    targets = torch.nn.functional.normalize(targets, dim=1)
+    logits = projected @ targets.T / max(temperature, 1e-6)
+    labels = torch.arange(projected.size(0), device=projected.device)
+    loss = torch.nn.functional.cross_entropy(logits, labels)
+    if symmetric:
+        logits_rev = targets @ projected.T / max(temperature, 1e-6)
+        loss = 0.5 * (
+            loss + torch.nn.functional.cross_entropy(logits_rev, labels)
+        )
+    return loss
+
+
+def train_micm(
+    warm_features: List[List[float]],
+    warm_factors: List[List[float]],
+    config: MICMConfig,
+    prefer_gpu: bool = True,
+) -> MICMModel:
+    device = _torch_device(prefer_gpu)
+    model = MICMModel(len(warm_features[0]), len(warm_factors[0])).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr, weight_decay=config.reg)
+
+    X = _tensor_from(warm_features, device)
+    Y = _tensor_from(warm_factors, device)
+    dataset = torch.utils.data.TensorDataset(X, Y)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
+
+    for _ in range(config.iters):
+        for batch_x, batch_y in loader:
+            optimizer.zero_grad()
+            projected = model(batch_x)
+            loss = _info_nce_loss(projected, batch_y, config.temperature, config.symmetric)
+            loss.backward()
+            optimizer.step()
+    return model.cpu()
+
+
+def infer_micm(
+    model: MICMModel,
+    cold_features: List[List[float]],
+    prefer_gpu: bool = True,
+    batch_size: int = 4096,
+) -> List[List[float]]:
+    device = _torch_device(prefer_gpu)
+    model = model.to(device)
+    model.eval()
+    outputs: List[List[float]] = []
+    with torch.no_grad():
+        for start in range(0, len(cold_features), batch_size):
+            batch = torch.tensor(
+                cold_features[start : start + batch_size],
+                dtype=torch.float32,
+                device=device,
+            )
+            preds = model(batch)
+            outputs.extend(preds.cpu().numpy().tolist())
+    model.cpu()
+    return outputs
+
+
 class CDLModel(nn.Module):
     def __init__(self, n_features: int, hidden_dim: int, n_factors: int) -> None:
         super().__init__()
@@ -469,6 +552,9 @@ __all__ = [
     "A2FTorchConfig",
     "train_a2f",
     "infer_a2f",
+    "MICMConfig",
+    "train_micm",
+    "infer_micm",
     "CDLTorchConfig",
     "train_cdl",
     "infer_cdl",

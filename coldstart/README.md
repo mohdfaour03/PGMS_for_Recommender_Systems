@@ -27,7 +27,7 @@ For a practical benchmark you can fetch MovieLens latest-small or latest (≈1M 
 
 3. **Train and evaluate**
 
-   Set `model_choice` to any of `ctrlite`, `a2f`, `ctpf`, `cdl`, `hft`, or `all` and execute the training cell. Results (Hit@K, NDCG@K) are returned as a JSON-like dictionary, and model artefacts are written alongside the prepared data.
+   Set `model_choice` to any of `ctrlite`, `a2f`, `ctpf`, `cdl`, `hft`, `micm`, or `all` and execute the training cell. Results (Hit@K, NDCG@K) are returned as a JSON-like dictionary, and model artefacts are written alongside the prepared data. The `micm` option introduces an experimental mutual-information contrastive mapper that aligns text features with collaborative factors via an InfoNCE loss.
 
 The same functions can be scripted directly in Python if you prefer not to use the notebook:
 

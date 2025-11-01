@@ -95,6 +95,7 @@ def train_and_evaluate_content_model(
     ctpf_cfg: dict | None = None,
     cdl_cfg: dict | None = None,
     hft_cfg: dict | None = None,
+    micm_cfg: dict | None = None,
     mf_cfg: dict | None = None,
     backend: str = "numpy",
     prefer_gpu: bool = True,
@@ -139,7 +140,7 @@ def train_and_evaluate_content_model(
     order = [item_to_idx[item] for item in warm_item_ids]
     V_ordered = [V[idx] for idx in order]
 
-    available_models = ("ctrlite", "a2f", "ctpf", "cdl", "hft")
+    available_models = ("ctrlite", "a2f", "ctpf", "cdl", "hft", "micm")
     requested: list[str]
     if isinstance(model, str):
         model_lower = model.lower()
@@ -371,6 +372,31 @@ def train_and_evaluate_content_model(
             scores = _score(U, V_cold)
             metrics = hit_ndcg_at_k(scores, user_to_idx, cold_item_ids, cold_rows, k=k_eval)
             results["hft"] = metrics
+        elif name == "micm":
+            if not use_torch:
+                print("micm requires backend='torch'; skipping.")
+                continue
+            cfg = micm_cfg or {}
+            micm_config = torch_backend.MICMConfig(
+                lr=float(cfg.get("lr", 1e-3)),
+                reg=float(cfg.get("reg", 1e-4)),
+                iters=int(cfg.get("iters", 200)),
+                batch_size=int(cfg.get("batch_size", 1024)),
+                temperature=float(cfg.get("temperature", 0.07)),
+                symmetric=bool(cfg.get("symmetric", True)),
+            )
+            micm_model = torch_backend.train_micm(
+                warm_features, V_ordered, micm_config, prefer_gpu=prefer_gpu
+            )
+            V_cold = torch_backend.infer_micm(
+                micm_model,
+                cold_features,
+                prefer_gpu=prefer_gpu,
+                batch_size=infer_batch_size,
+            )
+            scores = _score(U, V_cold)
+            metrics = hit_ndcg_at_k(scores, user_to_idx, cold_item_ids, cold_rows, k=k_eval)
+            results["micm"] = metrics
 
     if adaptive and "ctrlite" not in requested:
         print("Adaptive user refit is only available for ctrlite; skipping.")
