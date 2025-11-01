@@ -81,7 +81,7 @@ def _refit_users(
 def train_and_evaluate_content_model(
     data_dir: str | Path,
     k_factors: int = 32,
-    k_eval: int = 10,
+    k_eval: int | Sequence[int] = 10,
     mf_reg: float = 0.02,
     mf_iters: int = 30,
     mf_lr: float = 0.02,
@@ -107,6 +107,13 @@ def train_and_evaluate_content_model(
     cold_item_ids = data_io.load_json(data_path / "cold_item_ids.json")
     warm_features = data_io.load_matrix(data_path / "warm_item_text_features.json")
     cold_features = data_io.load_matrix(data_path / "cold_item_text_features.json")
+
+    if isinstance(k_eval, int):
+        eval_ks = [k_eval]
+    else:
+        eval_ks = [int(k) for k in k_eval]
+    if not eval_ks or any(k <= 0 for k in eval_ks):
+        raise ValueError("k_eval must contain positive integer(s).")
 
     backend_key = backend.lower()
     use_torch = backend_key == "torch"
@@ -172,6 +179,19 @@ def train_and_evaluate_content_model(
             )
         return ctr_lite.score_users_on_cold(users, items)
 
+    def _collect_metrics(score_matrix: list[list[float]]) -> Dict[str, float]:
+        metrics: Dict[str, float] = {}
+        evaluated = None
+        for k_value in eval_ks:
+            per_k = hit_ndcg_at_k(score_matrix, user_to_idx, cold_item_ids, cold_rows, k=k_value)
+            metrics[f"hit@{k_value}"] = per_k[f"hit@{k_value}"]
+            metrics[f"ndcg@{k_value}"] = per_k[f"ndcg@{k_value}"]
+            if evaluated is None:
+                evaluated = per_k.get("evaluated_users")
+        if evaluated is not None:
+            metrics["evaluated_users"] = evaluated
+        return metrics
+
     for name in requested:
         if name == "ctrlite":
             if use_torch:
@@ -202,7 +222,7 @@ def train_and_evaluate_content_model(
                 scores = _score(U, V_cold)
                 ctrlite_cache["W"] = W
             ctrlite_cache["V_cold"] = V_cold
-            metrics = hit_ndcg_at_k(scores, user_to_idx, cold_item_ids, cold_rows, k=k_eval)
+            metrics = _collect_metrics(scores)
             results["ctrlite"] = metrics
         elif name == "a2f":
             cfg = a2f_cfg or {}
@@ -242,7 +262,7 @@ def train_and_evaluate_content_model(
                 params = a2f.train_a2f_mlp(warm_features, V_ordered, cpu_cfg)
                 V_cold = a2f.infer_item_factors(cold_features, params)
             scores = _score(U, V_cold)
-            metrics = hit_ndcg_at_k(scores, user_to_idx, cold_item_ids, cold_rows, k=k_eval)
+            metrics = _collect_metrics(scores)
             results["a2f"] = metrics
         elif name == "ctpf":
             cfg = ctpf_cfg or {}
@@ -281,7 +301,7 @@ def train_and_evaluate_content_model(
                     cold_features, params, projection_iters, seed_ctpf + 1
                 )
             scores = _score(U, V_cold)
-            metrics = hit_ndcg_at_k(scores, user_to_idx, cold_item_ids, cold_rows, k=k_eval)
+            metrics = _collect_metrics(scores)
             results["ctpf"] = metrics
         elif name == "cdl":
             cfg = cdl_cfg or {}
@@ -328,7 +348,7 @@ def train_and_evaluate_content_model(
                 params = cdl.train_cdl(warm_features, V_ordered, cpu_cfg)
                 V_cold = cdl.infer_item_factors(cold_features, params)
             scores = _score(U, V_cold)
-            metrics = hit_ndcg_at_k(scores, user_to_idx, cold_item_ids, cold_rows, k=k_eval)
+            metrics = _collect_metrics(scores)
             results["cdl"] = metrics
         elif name == "hft":
             cfg = hft_cfg or {}
@@ -370,7 +390,7 @@ def train_and_evaluate_content_model(
                     cold_features, params, projection_iters, seed_hft + 1, cpu_cfg.kappa
                 )
             scores = _score(U, V_cold)
-            metrics = hit_ndcg_at_k(scores, user_to_idx, cold_item_ids, cold_rows, k=k_eval)
+            metrics = _collect_metrics(scores)
             results["hft"] = metrics
         elif name == "micm":
             if not use_torch:
@@ -395,7 +415,7 @@ def train_and_evaluate_content_model(
                 batch_size=infer_batch_size,
             )
             scores = _score(U, V_cold)
-            metrics = hit_ndcg_at_k(scores, user_to_idx, cold_item_ids, cold_rows, k=k_eval)
+            metrics = _collect_metrics(scores)
             results["micm"] = metrics
 
     if adaptive and "ctrlite" not in requested:
@@ -430,9 +450,7 @@ def train_and_evaluate_content_model(
             user_items, blend, k_factors, mf_reg, mf_lr, max(5, mf_iters // 2)
         )
         scores_adapt = _score(U_adapt, ctrlite_cache["V_cold"])
-        adaptive_metrics = hit_ndcg_at_k(
-            scores_adapt, user_to_idx, cold_item_ids, cold_rows, k=k_eval
-        )
+        adaptive_metrics = _collect_metrics(scores_adapt)
         results["ctrlite_adaptive"] = adaptive_metrics
 
     return results
