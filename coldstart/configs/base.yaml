@@ -41,6 +41,14 @@ micm:
   lr: 0.001
   reg: 0.0001
   iters: 200
-  batch_size: 1024
-  temperature: 0.07
+  batch_size: 2048
+  temperature: 0.03
   symmetric: true
+  loss_type: multipos_nce
+  num_workers: 4
+  positives:
+    path: data/positives/cf_knn_top5.json
+    k: 5
+    min_cos: 0.6
+    include_self: true
+    whiten_cf: false

@@ -1,8 +1,11 @@
 """PyTorch-backed training utilities with optional GPU acceleration."""
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Sequence, Tuple
+import json
+import random
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -268,6 +271,15 @@ class MICMModel(nn.Module):
 
 
 @dataclass
+class MICMPositivesConfig:
+    path: str | None = None
+    k: int = 5
+    min_cos: Optional[float] = 0.6
+    include_self: bool = True
+    whiten_cf: bool = False
+
+
+@dataclass
 class MICMConfig:
     lr: float = 1e-3
     reg: float = 1e-4
@@ -275,6 +287,113 @@ class MICMConfig:
     batch_size: int = 1024
     temperature: float = 0.07
     symmetric: bool = True
+    loss_type: str = "info_nce"
+    num_workers: int = 0
+    positives: MICMPositivesConfig = field(default_factory=MICMPositivesConfig)
+
+
+def _load_positive_map(path: str | Path) -> Dict[str, List[str]]:
+    resolved = Path(path)
+    if not resolved.exists():
+        raise FileNotFoundError(f"Positive map not found at {resolved}")
+    with resolved.open("r", encoding="utf-8") as fh:
+        raw = json.load(fh)
+    if not isinstance(raw, dict):
+        raise ValueError(f"Expected dict in {resolved}, found {type(raw).__name__}")
+    positives: Dict[str, List[str]] = {}
+    for key, value in raw.items():
+        if not isinstance(value, list):
+            raise ValueError(f"Positive list for key '{key}' must be a list.")
+        positives[str(key)] = [str(item) for item in value]
+    return positives
+
+
+def _validate_positive_map(
+    positives: Dict[str, List[str]],
+    warm_ids: Sequence[str],
+    include_self: bool,
+) -> Dict[str, List[str]]:
+    warm_set = {str(item) for item in warm_ids}
+    filtered: Dict[str, List[str]] = {}
+    leakage: Dict[str, List[str]] = {}
+    for anchor, neighbors in positives.items():
+        anchor_str = str(anchor)
+        if anchor_str not in warm_set:
+            continue
+        valid_neighbors: List[str] = []
+        leaked: List[str] = []
+        for neighbor in neighbors:
+            neighbor_str = str(neighbor)
+            if neighbor_str in warm_set:
+                if neighbor_str not in valid_neighbors:
+                    valid_neighbors.append(neighbor_str)
+            else:
+                leaked.append(neighbor_str)
+        if leaked:
+            leakage[anchor_str] = leaked
+        filtered[anchor_str] = valid_neighbors
+    if leakage:
+        sample_anchor, leaked_ids = next(iter(leakage.items()))
+        raise ValueError(
+            f"Positive map leakage detected (e.g. {sample_anchor} -> {leaked_ids[:5]}). "
+            "Ensure only warm item ids are present."
+        )
+    coverage = sum(1 for anchor in warm_ids if str(anchor) in positives) / max(len(warm_ids), 1)
+    if coverage < 0.95:
+        raise ValueError(f"Positive map coverage below 95% (currently {coverage * 100:.2f}%).")
+    for anchor in warm_ids:
+        anchor_key = str(anchor)
+        neighbors = filtered.setdefault(anchor_key, [])
+        if include_self and anchor_key not in neighbors:
+            neighbors.insert(0, anchor_key)
+    return filtered
+
+
+class _MICMDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        item_ids: Sequence[str],
+        warm_features: Sequence[Sequence[float]],
+        warm_factors: Sequence[Sequence[float]],
+        positives: Dict[str, List[str]] | None,
+    ) -> None:
+        self.item_ids = [str(item) for item in item_ids]
+        self.features = torch.tensor(warm_features, dtype=torch.float32)
+        self.factors = torch.tensor(warm_factors, dtype=torch.float32)
+        if self.features.shape[0] != len(self.item_ids) or self.factors.shape[0] != len(self.item_ids):
+            raise ValueError("Warm features and factors must align with warm item ids.")
+        self.positives = positives or {}
+
+    def __len__(self) -> int:
+        return len(self.item_ids)
+
+    def __getitem__(
+        self, idx: int
+    ) -> Tuple[str, torch.Tensor, torch.Tensor, Optional[List[str]]]:
+        item_id = self.item_ids[idx]
+        pos = self.positives.get(item_id)
+        return item_id, self.features[idx], self.factors[idx], list(pos) if pos is not None else None
+
+
+def _build_batch_positive_indices(
+    batch_item_ids: Sequence[str],
+    batch_pos_lists: Sequence[Optional[Sequence[str]]],
+) -> List[List[int]]:
+    lookup = {item_id: idx for idx, item_id in enumerate(batch_item_ids)}
+    indices: List[List[int]] = []
+    for row_idx, anchor in enumerate(batch_item_ids):
+        candidates = batch_pos_lists[row_idx] or []
+        seen: set[str] = set()
+        resolved: List[int] = []
+        for candidate in candidates:
+            candidate_id = str(candidate)
+            if candidate_id in lookup and candidate_id not in seen:
+                seen.add(candidate_id)
+                resolved.append(lookup[candidate_id])
+        if not resolved:
+            resolved = [row_idx]
+        indices.append(resolved)
+    return indices
 
 
 def _info_nce_loss(
@@ -293,28 +412,170 @@ def _info_nce_loss(
     return loss
 
 
+def _multi_positive_nce_loss(
+    projected: torch.Tensor,
+    targets: torch.Tensor,
+    temperature: float,
+    positive_indices: Sequence[Sequence[int]],
+) -> torch.Tensor:
+    projected = torch.nn.functional.normalize(projected, dim=1)
+    targets = torch.nn.functional.normalize(targets, dim=1)
+    logits = projected @ targets.T / max(temperature, 1e-6)
+    logits = logits - logits.max(dim=1, keepdim=True).values
+    exp_logits = torch.exp(logits)
+    denom = exp_logits.sum(dim=1).clamp_min(1e-12)
+    batch = projected.size(0)
+    pos_mask = torch.zeros((batch, batch), dtype=torch.bool, device=logits.device)
+    for row_idx, cols in enumerate(positive_indices):
+        if cols:
+            pos_mask[row_idx, cols] = True
+    pos_sum = (exp_logits * pos_mask).sum(dim=1)
+    diag_exp = exp_logits.diagonal()
+    pos_sum = torch.where(pos_mask.any(dim=1), pos_sum, diag_exp)
+    loss = -torch.log((pos_sum / denom).clamp_min(1e-12))
+    return loss.mean()
+
+
+def _supervised_contrastive_loss(
+    projected: torch.Tensor,
+    targets: torch.Tensor,
+    temperature: float,
+    positive_indices: Sequence[Sequence[int]],
+) -> torch.Tensor:
+    projected = torch.nn.functional.normalize(projected, dim=1)
+    targets = torch.nn.functional.normalize(targets, dim=1)
+    logits = projected @ targets.T / max(temperature, 1e-6)
+    logits = logits - logits.max(dim=1, keepdim=True).values
+    batch = projected.size(0)
+    denom_mask = torch.ones((batch, batch), dtype=torch.bool, device=logits.device)
+    denom_mask.fill_diagonal_(False)
+    masked_logits = logits.masked_fill(~denom_mask, float("-inf"))
+    log_denom = torch.logsumexp(masked_logits, dim=1)
+    losses: List[torch.Tensor] = []
+    for row_idx, cols in enumerate(positive_indices):
+        cols = list(cols)
+        if not cols:
+            cols = [row_idx]
+        index_tensor = torch.tensor(cols, dtype=torch.long, device=logits.device)
+        pos_logits = logits[row_idx].index_select(0, index_tensor)
+        denom_value = log_denom[row_idx]
+        if not torch.isfinite(denom_value):
+            denom_value = logits[row_idx, row_idx]
+        losses.append(-(pos_logits - denom_value).mean())
+    return torch.stack(losses).mean()
+
+
 def train_micm(
+    warm_item_ids: Sequence[str],
     warm_features: List[List[float]],
     warm_factors: List[List[float]],
     config: MICMConfig,
     prefer_gpu: bool = True,
 ) -> MICMModel:
     device = _torch_device(prefer_gpu)
+    if not warm_item_ids:
+        raise ValueError("warm_item_ids cannot be empty.")
+    if len(warm_item_ids) != len(warm_features) or len(warm_item_ids) != len(warm_factors):
+        raise ValueError("Warm item ids, features, and factors must share the same length.")
+
+    loss_type = (config.loss_type or "info_nce").lower()
+    valid_losses = {"info_nce", "multipos_nce", "supcon"}
+    if loss_type not in valid_losses:
+        raise ValueError(f"Unsupported MICM loss_type='{config.loss_type}'. Expected one of {sorted(valid_losses)}.")
+
+    print(
+        f"[micm] training with loss='{loss_type}' "
+        f"(temperature={config.temperature:.4f}, symmetric={config.symmetric})"
+    )
+
+    positives_map: Dict[str, List[str]] | None = None
+    if config.positives.path:
+        try:
+            raw_map = _load_positive_map(config.positives.path)
+        except FileNotFoundError:
+            print(
+                f"[micm] positives file '{config.positives.path}' not found; using self-only positives."
+            )
+        else:
+            positives_map = _validate_positive_map(
+                raw_map, warm_item_ids, include_self=config.positives.include_self
+            )
+            covered = sum(1 for key in warm_item_ids if positives_map.get(str(key)))
+            avg_len = (
+                sum(len(values) for values in positives_map.values()) / max(len(positives_map), 1)
+            )
+            print(
+                f"[micm] loaded positives for {covered}/{len(warm_item_ids)} items; "
+                f"avg list length={avg_len:.2f}"
+            )
+            id_to_idx = {str(item_id): idx for idx, item_id in enumerate(warm_item_ids)}
+            normed_factors = torch.nn.functional.normalize(
+                torch.tensor(warm_factors, dtype=torch.float32), dim=1
+            )
+            available = [str(item_id) for item_id in warm_item_ids if positives_map.get(str(item_id))]
+            if available:
+                rng = random.Random(0)
+                for anchor in rng.sample(available, min(3, len(available))):
+                    neighbors = positives_map.get(anchor, [])[: max(1, config.positives.k)]
+                    anchor_idx = id_to_idx[anchor]
+                    anchor_vec = normed_factors[anchor_idx]
+                    scored = []
+                    for neighbor in neighbors:
+                        n_idx = id_to_idx.get(neighbor)
+                        if n_idx is None:
+                            continue
+                        score = float(torch.dot(anchor_vec, normed_factors[n_idx]).item())
+                        scored.append((neighbor, score))
+                    formatted = ", ".join(f"{nid}:{score:.3f}" for nid, score in scored)
+                    print(f"[micm] positives sample {anchor}: {formatted}")
+    else:
+        if loss_type != "info_nce":
+            print("[micm] warning: multi-positive loss selected without positives map; falling back to self-only positives.")
+
+    dataset = _MICMDataset(warm_item_ids, warm_features, warm_factors, positives_map)
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=max(0, int(config.num_workers)),
+        drop_last=False,
+    )
+
     model = MICMModel(len(warm_features[0]), len(warm_factors[0])).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr, weight_decay=config.reg)
 
-    X = _tensor_from(warm_features, device)
-    Y = _tensor_from(warm_factors, device)
-    dataset = torch.utils.data.TensorDataset(X, Y)
-    loader = torch.utils.data.DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
+    for epoch in range(config.iters):
+        epoch_loss = 0.0
+        epoch_samples = 0
+        epoch_positive_total = 0
+        for batch_item_ids, batch_x, batch_y, batch_pos in loader:
+            batch_x = batch_x.to(device)
+            batch_y = batch_y.to(device)
+            positive_indices = _build_batch_positive_indices(batch_item_ids, batch_pos)
 
-    for _ in range(config.iters):
-        for batch_x, batch_y in loader:
             optimizer.zero_grad()
             projected = model(batch_x)
-            loss = _info_nce_loss(projected, batch_y, config.temperature, config.symmetric)
+            if loss_type == "multipos_nce":
+                loss = _multi_positive_nce_loss(projected, batch_y, config.temperature, positive_indices)
+            elif loss_type == "supcon":
+                loss = _supervised_contrastive_loss(projected, batch_y, config.temperature, positive_indices)
+            else:
+                loss = _info_nce_loss(projected, batch_y, config.temperature, config.symmetric)
             loss.backward()
             optimizer.step()
+
+            batch_size_actual = batch_x.size(0)
+            epoch_loss += loss.item() * batch_size_actual
+            epoch_samples += batch_size_actual
+            epoch_positive_total += sum(len(indices) for indices in positive_indices)
+
+        if epoch_samples > 0:
+            avg_loss = epoch_loss / epoch_samples
+            avg_pos = epoch_positive_total / epoch_samples
+            print(
+                f"[micm] epoch {epoch + 1}/{config.iters}: loss={avg_loss:.4f}, "
+                f"avg_pos_per_anchor={avg_pos:.2f}"
+            )
     return model.cpu()
 
 

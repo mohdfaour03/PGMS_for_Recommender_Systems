@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Sequence
+from typing import Any, Dict, Sequence
 
 from . import data_io
 from .evaluation import hit_ndcg_at_k
@@ -16,6 +16,43 @@ def _unique_item_text(interactions: Sequence[dict]) -> Dict[str, str]:
     for row in interactions:
         item_text.setdefault(row["item_id"], row["item_text"])
     return item_text
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if not lowered:
+            return default
+        if lowered in {"true", "1", "yes", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "off"}:
+            return False
+    return bool(value)
+
+
+def _coerce_int(value: Any, default: int) -> int:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if not lowered or lowered in {"none", "null"}:
+            return default
+    return int(value)
+
+
+def _coerce_optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if not lowered or lowered in {"none", "null"}:
+            return None
+        return float(value)
+    return float(value)
 
 
 def prepare_dataset(
@@ -397,16 +434,33 @@ def train_and_evaluate_content_model(
                 print("micm requires backend='torch'; skipping.")
                 continue
             cfg = micm_cfg or {}
+            pos_cfg = dict(cfg.get("positives", {}) or {})
+            path_value = pos_cfg.get("path")
+            if isinstance(path_value, str):
+                path_value = path_value.strip() or None
             micm_config = torch_backend.MICMConfig(
                 lr=float(cfg.get("lr", 1e-3)),
                 reg=float(cfg.get("reg", 1e-4)),
-                iters=int(cfg.get("iters", 200)),
-                batch_size=int(cfg.get("batch_size", 1024)),
+                iters=_coerce_int(cfg.get("iters"), 200),
+                batch_size=max(1, _coerce_int(cfg.get("batch_size"), 1024)),
                 temperature=float(cfg.get("temperature", 0.07)),
-                symmetric=bool(cfg.get("symmetric", True)),
+                symmetric=_coerce_bool(cfg.get("symmetric"), True),
+                loss_type=str(cfg.get("loss_type", "info_nce")),
+                num_workers=max(0, _coerce_int(cfg.get("num_workers"), 0)),
+                positives=torch_backend.MICMPositivesConfig(
+                    path=path_value,
+                    k=max(1, _coerce_int(pos_cfg.get("k"), 5)),
+                    min_cos=_coerce_optional_float(pos_cfg.get("min_cos")),
+                    include_self=_coerce_bool(pos_cfg.get("include_self"), True),
+                    whiten_cf=_coerce_bool(pos_cfg.get("whiten_cf"), False),
+                ),
             )
             micm_model = torch_backend.train_micm(
-                warm_features, V_ordered, micm_config, prefer_gpu=prefer_gpu
+                warm_item_ids,
+                warm_features,
+                V_ordered,
+                micm_config,
+                prefer_gpu=prefer_gpu,
             )
             V_cold = torch_backend.infer_micm(
                 micm_model,
