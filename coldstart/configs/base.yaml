@@ -42,9 +42,9 @@ micm:
   reg: 0.0001
   iters: 200
   batch_size: 2048
-  temperature: 0.03
+  temperature: 0.05
   symmetric: true
-  loss_type: multipos_nce
+  loss_type: supcon
   num_workers: 4
   positives:
     path: data/positives/cf_knn_top5.json
