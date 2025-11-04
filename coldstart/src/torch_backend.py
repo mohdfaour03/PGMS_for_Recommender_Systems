@@ -376,6 +376,16 @@ class _MICMDataset(torch.utils.data.Dataset):
         return item_id, self.features[idx], self.factors[idx], positives_list
 
 
+def _micm_collate_fn(
+    batch: Sequence[Tuple[str, torch.Tensor, torch.Tensor, Sequence[str]]]
+) -> Tuple[List[str], torch.Tensor, torch.Tensor, List[List[str]]]:
+    item_ids = [item_id for item_id, _, _, _ in batch]
+    features = torch.stack([feat for _, feat, _, _ in batch], dim=0)
+    factors = torch.stack([factor for _, _, factor, _ in batch], dim=0)
+    positives = [list(pos_list) for _, _, _, pos_list in batch]
+    return item_ids, features, factors, positives
+
+
 def _build_batch_positive_indices(
     batch_item_ids: Sequence[str],
     batch_pos_lists: Sequence[Optional[Sequence[str]]],
@@ -540,6 +550,7 @@ def train_micm(
         shuffle=True,
         num_workers=max(0, int(config.num_workers)),
         drop_last=False,
+        collate_fn=_micm_collate_fn,
     )
 
     model = MICMModel(len(warm_features[0]), len(warm_factors[0])).to(device)
