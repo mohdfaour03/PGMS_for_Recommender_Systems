@@ -372,7 +372,8 @@ class _MICMDataset(torch.utils.data.Dataset):
     ) -> Tuple[str, torch.Tensor, torch.Tensor, Optional[List[str]]]:
         item_id = self.item_ids[idx]
         pos = self.positives.get(item_id)
-        return item_id, self.features[idx], self.factors[idx], list(pos) if pos is not None else None
+        positives_list = list(pos) if pos is not None else []
+        return item_id, self.features[idx], self.factors[idx], positives_list
 
 
 def _build_batch_positive_indices(
