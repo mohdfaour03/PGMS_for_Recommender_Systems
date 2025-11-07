@@ -52,3 +52,26 @@ micm:
     min_cos: 0.6
     include_self: true
     whiten_cf: false
+cmcl:
+  lr: 0.0005
+  reg: 0.0001
+  iters: 60
+  batch_size: 128
+  temperature: 0.05
+  self_normalize: true
+  topk_focal_k: 3
+  topk_focal_gamma: 2.0
+  max_positives: 24
+  pi_floor: 0.01
+  max_weight: 50.0
+  hard_negatives:
+    k: 3
+    min_sim: 0.6
+  exposure:
+    negatives_per_positive: 5
+    hidden_dim: 64
+    batch_size: 4096
+    epochs: 5
+    lr: 0.001
+    pi_min: 0.01
+    seed: 13

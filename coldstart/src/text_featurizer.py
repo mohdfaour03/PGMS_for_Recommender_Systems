@@ -1,9 +1,17 @@
-"""Lightweight TF-IDF featurizer with leakage guard."""
+"""Lightweight text featurizers with leakage guard."""
 from __future__ import annotations
 
 import math
 from collections import Counter, defaultdict
 from typing import Dict, List, Sequence, Tuple
+
+try:
+    import torch
+    from transformers import AutoModel, AutoTokenizer
+except Exception:  # pragma: no cover - optional dependency
+    torch = None
+    AutoModel = None
+    AutoTokenizer = None
 
 
 class SimpleTfidfVectorizer:
@@ -136,3 +144,133 @@ class TfidfTextFeaturizer:
         vocab = state.get("vocabulary") or {}
         self.vectorizer.vocabulary_ = {str(k): int(v) for k, v in vocab.items()}
         self.vectorizer.idf_ = [float(x) for x in state.get("idf", [])]
+
+
+class FrozenBertLinearFeaturizer:
+    """Use a frozen BERT encoder plus optional linear projection for item text."""
+
+    def __init__(
+        self,
+        model_name: str = "bert-base-uncased",
+        batch_size: int = 32,
+        max_length: int = 64,
+        pooling: str = "cls",
+        proj_dim: int | None = 256,
+        device: str | None = None,
+    ) -> None:
+        if torch is None or AutoModel is None or AutoTokenizer is None:  # pragma: no cover - dynamic import
+            raise ImportError("transformers and torch are required for frozen_bert_linear.")
+        self.model_name = model_name
+        self.batch_size = max(1, batch_size)
+        self.max_length = max(8, max_length)
+        self.pooling = pooling if pooling in {"cls", "mean"} else "cls"
+        self.proj_dim = proj_dim
+        self.device_name = device
+        self._tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self._model = AutoModel.from_pretrained(model_name)
+        self._model.eval()
+        for param in self._model.parameters():
+            param.requires_grad = False
+        if self.device_name:
+            device_obj = torch.device(self.device_name)
+        else:
+            device_obj = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._device = device_obj
+        self._model.to(self._device)
+        self._mean: torch.Tensor | None = None
+        self._proj: torch.Tensor | None = None
+
+    def _embed(self, item_texts: Sequence[str]) -> torch.Tensor:
+        outputs: List[torch.Tensor] = []
+        for start in range(0, len(item_texts), self.batch_size):
+            batch = [text or "" for text in item_texts[start : start + self.batch_size]]
+            encoded = self._tokenizer(
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors="pt",
+            )
+            encoded = {key: value.to(self._device) for key, value in encoded.items()}
+            with torch.no_grad():
+                result = self._model(**encoded)
+                hidden = result.last_hidden_state
+                if self.pooling == "mean":
+                    pooled = hidden.mean(dim=1)
+                else:
+                    pooled = hidden[:, 0, :]
+            outputs.append(pooled.cpu())
+        if not outputs:
+            return torch.zeros((0, self._model.config.hidden_size))
+        return torch.cat(outputs, dim=0)
+
+    def _project_embeddings(self, embeddings: torch.Tensor, fit: bool) -> torch.Tensor:
+        if embeddings.numel() == 0:
+            return embeddings
+        if fit:
+            self._mean = embeddings.mean(dim=0, keepdim=True)
+        if self._mean is None:
+            raise RuntimeError("BERT featurizer must be fit before transform().")
+        centered = embeddings - self._mean
+        if fit and self.proj_dim and 0 < self.proj_dim < centered.shape[1]:
+            q = min(centered.shape[0], centered.shape[1], self.proj_dim + 8)
+            q = max(q, self.proj_dim)
+            U, S, V = torch.pca_lowrank(centered, q=q, center=False)
+            self._proj = V[:, : self.proj_dim]
+        if self._proj is not None:
+            return centered @ self._proj
+        return centered
+
+    def fit_warm(self, item_texts: Sequence[str]) -> None:
+        embeddings = self._embed(item_texts)
+        _ = self._project_embeddings(embeddings, fit=True)
+
+    def transform(self, item_texts: Sequence[str]) -> List[List[float]]:
+        embeddings = self._embed(item_texts)
+        projected = self._project_embeddings(embeddings, fit=False)
+        return projected.numpy().tolist()
+
+    def fit_transform_warm(self, item_texts: Sequence[str]) -> List[List[float]]:
+        embeddings = self._embed(item_texts)
+        projected = self._project_embeddings(embeddings, fit=True)
+        return projected.numpy().tolist()
+
+    def save_state(self) -> dict:
+        if self._mean is None:
+            raise RuntimeError("Cannot save state before fit.")
+        state = {
+            "type": "frozen_bert_linear",
+            "model_name": self.model_name,
+            "batch_size": self.batch_size,
+            "max_length": self.max_length,
+            "pooling": self.pooling,
+            "proj_dim": self.proj_dim,
+            "device": str(self._device),
+            "mean": self._mean.detach().cpu().numpy().tolist(),
+        }
+        if self._proj is not None:
+            state["proj"] = self._proj.detach().cpu().numpy().tolist()
+        return state
+
+    def load_state(self, state: dict) -> None:
+        self._mean = torch.tensor(state["mean"], dtype=torch.float32)
+        proj = state.get("proj")
+        self._proj = torch.tensor(proj, dtype=torch.float32) if proj is not None else None
+
+
+def build_text_featurizer(kind: str = "tfidf", params: dict | None = None):
+    params = params or {}
+    key = (kind or "tfidf").strip().lower()
+    if key == "tfidf":
+        return TfidfTextFeaturizer(**params)
+    if key == "frozen_bert_linear":
+        return FrozenBertLinearFeaturizer(**params)
+    raise ValueError(f"Unknown text encoder '{kind}'.")
+
+
+__all__ = [
+    "SimpleTfidfVectorizer",
+    "TfidfTextFeaturizer",
+    "FrozenBertLinearFeaturizer",
+    "build_text_featurizer",
+]

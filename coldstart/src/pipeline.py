@@ -6,9 +6,10 @@ from typing import Any, Dict, Sequence
 
 from . import data_io
 from .evaluation import hit_ndcg_at_k
+from .exposure import ExposureConfig, load_exposure_checkpoint, train_exposure_model
 from .models import a2f, cdl, ctr_lite, ctpf, hft, mf
 from .split_strict import persist_split, strict_cold_split
-from .text_featurizer import TfidfTextFeaturizer
+from .text_featurizer import build_text_featurizer
 
 
 def _unique_item_text(interactions: Sequence[dict]) -> Dict[str, str]:
@@ -58,38 +59,63 @@ def _coerce_optional_float(value: Any) -> float | None:
 def prepare_dataset(
     data_path: str | Path,
     out_dir: str | Path,
-    tfidf_params: dict,
+    tfidf_params: dict | None = None,
+    encoder_type: str = "tfidf",
+    encoder_params: dict | None = None,
     cold_item_frac: float = 0.15,
+    val_item_frac: float | None = None,
     seed: int = 42,
     interaction_limit: int | None = None,
 ) -> None:
     interactions = data_io.load_interactions(data_path, limit=interaction_limit)
     if interaction_limit is not None:
         print(f"Using {len(interactions)} interactions out of the source data (limit={interaction_limit}).")
-    warm_rows, cold_rows, cold_items = strict_cold_split(
-        interactions, cold_item_frac=cold_item_frac, seed=seed
+    warm_rows, val_rows, cold_rows, val_items, cold_items = strict_cold_split(
+        interactions, cold_item_frac=cold_item_frac, val_item_frac=val_item_frac, seed=seed
     )
-    persist_split(warm_rows, cold_rows, cold_items, out_dir)
+    persist_split(
+        warm_rows,
+        cold_rows,
+        cold_items,
+        out_dir,
+        val_rows=val_rows if val_rows else None,
+        val_items=val_items if val_items else None,
+    )
 
     warm_item_text = _unique_item_text(warm_rows)
+    val_item_text = _unique_item_text(val_rows)
     cold_item_text = _unique_item_text(cold_rows)
     warm_item_ids = sorted(warm_item_text)
+    val_item_ids = sorted(val_item_text)
     cold_item_ids = sorted(cold_item_text)
 
-    featurizer = TfidfTextFeaturizer(**tfidf_params)
+    encoder_kwargs = dict(encoder_params or tfidf_params or {})
+    featurizer = build_text_featurizer(encoder_type, encoder_kwargs)
     warm_texts = [warm_item_text[item] for item in warm_item_ids]
     warm_features = featurizer.fit_transform_warm(warm_texts)
+    val_features = featurizer.transform([val_item_text[item] for item in val_item_ids]) if val_item_ids else []
     cold_texts = [cold_item_text[item] for item in cold_item_ids]
     cold_features = featurizer.transform(cold_texts)
     print(f"Warm text features shape: ({len(warm_features)}, {len(warm_features[0]) if warm_features else 0})")
+    if val_features:
+        print(f"Val text features shape: ({len(val_features)}, {len(val_features[0])})")
     print(f"Cold text features shape: ({len(cold_features)}, {len(cold_features[0]) if cold_features else 0})")
 
     out_path = Path(out_dir)
     data_io.save_json(warm_item_ids, out_path / "warm_item_ids.json")
+    if val_item_ids:
+        data_io.save_json(val_item_ids, out_path / "val_item_ids.json")
     data_io.save_json(cold_item_ids, out_path / "cold_item_ids.json")
     data_io.save_matrix(warm_features, out_path / "warm_item_text_features.json")
+    if val_features:
+        data_io.save_matrix(val_features, out_path / "val_item_text_features.json")
     data_io.save_matrix(cold_features, out_path / "cold_item_text_features.json")
-    data_io.save_json(featurizer.save_state(), out_path / "tfidf_state.json")
+    encoder_state = {
+        "encoder_type": encoder_type,
+        "state": featurizer.save_state(),
+    }
+    data_io.save_json(encoder_state, out_path / "text_encoder_state.json")
+    data_io.save_json(encoder_state, out_path / "tfidf_state.json")
 
 
 def _refit_users(
@@ -133,10 +159,11 @@ def train_and_evaluate_content_model(
     cdl_cfg: dict | None = None,
     hft_cfg: dict | None = None,
     micm_cfg: dict | None = None,
+    cmcl_cfg: dict | None = None,
     mf_cfg: dict | None = None,
     backend: str = "numpy",
     prefer_gpu: bool = True,
-) -> Dict[str, Dict[str, float]]:
+) -> Dict[str, Dict[str, object]]:
     data_path = Path(data_dir)
     warm_rows = data_io.load_interactions(data_path / "warm_interactions.csv")
     cold_rows = data_io.load_interactions(data_path / "cold_interactions.csv")
@@ -184,7 +211,7 @@ def train_and_evaluate_content_model(
     order = [item_to_idx[item] for item in warm_item_ids]
     V_ordered = [V[idx] for idx in order]
 
-    available_models = ("ctrlite", "a2f", "ctpf", "cdl", "hft", "micm")
+    available_models = ("ctrlite", "a2f", "ctpf", "cdl", "hft", "micm", "cmcl")
     requested: list[str]
     if isinstance(model, str):
         model_lower = model.lower()
@@ -204,7 +231,7 @@ def train_and_evaluate_content_model(
     if invalid:
         raise ValueError(f"Unknown model(s) requested: {invalid}")
 
-    results: Dict[str, Dict[str, float]] = {}
+    results: Dict[str, Dict[str, object]] = {}
     ctrlite_cache: Dict[str, object] = {}
     infer_batch_size = max(1, int(mf_cfg.get("infer_batch_size", 4096)))
     score_batch_size = max(1, int(mf_cfg.get("score_batch_size", 4096)))
@@ -216,17 +243,55 @@ def train_and_evaluate_content_model(
             )
         return ctr_lite.score_users_on_cold(users, items)
 
-    def _collect_metrics(score_matrix: list[list[float]]) -> Dict[str, float]:
-        metrics: Dict[str, float] = {}
-        evaluated = None
+    user_history_counts: Dict[str, int] = {}
+    for row in warm_rows:
+        user_history_counts[row["user_id"]] = user_history_counts.get(row["user_id"], 0) + 1
+    item_popularity_counts: Dict[str, int] = {}
+    for row in warm_rows:
+        item_popularity_counts[row["item_id"]] = item_popularity_counts.get(row["item_id"], 0) + 1
+    for row in cold_rows:
+        item_popularity_counts[row["item_id"]] = item_popularity_counts.get(row["item_id"], 0) + 1
+    item_text_len_map: Dict[str, int] = {}
+    for row in cold_rows:
+        text_len_value = row.get("text_len")
+        if text_len_value is None:
+            continue
+        item_text_len_map[row["item_id"]] = int(text_len_value)
+
+    def _collect_metrics(score_matrix: list[list[float]]) -> Dict[str, object]:
+        metrics: Dict[str, object] = {}
+        aggregated_buckets: Dict[str, Dict[str, Dict[str, float]]] = {}
+        evaluated = 0
         for k_value in eval_ks:
-            per_k = hit_ndcg_at_k(score_matrix, user_to_idx, cold_item_ids, cold_rows, k=k_value)
-            metrics[f"hit@{k_value}"] = per_k[f"hit@{k_value}"]
-            metrics[f"ndcg@{k_value}"] = per_k[f"ndcg@{k_value}"]
-            if evaluated is None:
-                evaluated = per_k.get("evaluated_users")
-        if evaluated is not None:
-            metrics["evaluated_users"] = evaluated
+            per_k = hit_ndcg_at_k(
+                score_matrix,
+                user_to_idx,
+                cold_item_ids,
+                cold_rows,
+                k=k_value,
+                user_history=user_history_counts,
+                item_popularity=item_popularity_counts,
+                item_text_len=item_text_len_map,
+            )
+            metrics[f"hit@{k_value}"] = per_k.get(f"hit@{k_value}", 0.0)
+            hit_ci = per_k.get(f"hit@{k_value}_ci")
+            if hit_ci is not None:
+                metrics[f"hit@{k_value}_ci"] = hit_ci
+            metrics[f"ndcg@{k_value}"] = per_k.get(f"ndcg@{k_value}", 0.0)
+            ndcg_ci = per_k.get(f"ndcg@{k_value}_ci")
+            if ndcg_ci is not None:
+                metrics[f"ndcg@{k_value}_ci"] = ndcg_ci
+            evaluated = per_k.get("evaluated_users", evaluated or 0)
+            bucket_info = per_k.get("buckets") or {}
+            for bucket_name, labels in bucket_info.items():
+                bucket_entry = aggregated_buckets.setdefault(bucket_name, {})
+                for label, stats in labels.items():
+                    label_entry = bucket_entry.setdefault(label, {})
+                    for key, value in stats.items():
+                        label_entry[key] = value
+        metrics["evaluated_users"] = evaluated
+        if aggregated_buckets:
+            metrics["buckets"] = aggregated_buckets
         return metrics
 
     for name in requested:
@@ -471,6 +536,113 @@ def train_and_evaluate_content_model(
             scores = _score(U, V_cold)
             metrics = _collect_metrics(scores)
             results["micm"] = metrics
+        elif name == "cmcl":
+            if not use_torch:
+                print("cmcl requires backend='torch'; skipping.")
+                continue
+            cfg = cmcl_cfg or {}
+            exposure_cfg = dict(cfg.get("exposure", {}) or {})
+            exposure_path_value = exposure_cfg.get("path")
+            exposure_path = (
+                Path(exposure_path_value)
+                if exposure_path_value
+                else models_dir / "exposure.ckpt"
+            )
+            max_pairs_value = exposure_cfg.get("max_training_samples")
+            exposure_config = ExposureConfig(
+                negatives_per_positive=max(1, _coerce_int(exposure_cfg.get("negatives_per_positive"), 5)),
+                hidden_dim=max(1, _coerce_int(exposure_cfg.get("hidden_dim"), 64)),
+                batch_size=max(32, _coerce_int(exposure_cfg.get("batch_size"), 4096)),
+                epochs=max(1, _coerce_int(exposure_cfg.get("epochs"), 5)),
+                lr=float(exposure_cfg.get("lr", 1e-3)),
+                pi_min=float(exposure_cfg.get("pi_min", 0.01)),
+                seed=_coerce_int(exposure_cfg.get("seed"), 13),
+                max_training_samples=(
+                    None
+                    if max_pairs_value in {None, "", "none"}
+                    else max(1, _coerce_int(max_pairs_value, 1_000_000))
+                ),
+                prefer_gpu=prefer_gpu,
+            )
+            if not exposure_path.exists():
+                print(f"[cmcl] exposure checkpoint missing at {exposure_path}; training estimator.")
+                train_exposure_model(warm_rows, exposure_path, exposure_config)
+            exposure_state = load_exposure_checkpoint(exposure_path)
+            pi_lookup = exposure_state.get("pi_lookup", {})
+            hard_cfg = dict(cfg.get("hard_negatives", {}) or {})
+            cmcl_config = torch_backend.CMCLConfig(
+                lr=float(cfg.get("lr", 5e-4)),
+                reg=float(cfg.get("reg", 1e-4)),
+                iters=max(1, _coerce_int(cfg.get("iters"), 60)),
+                batch_size=max(1, _coerce_int(cfg.get("batch_size"), 128)),
+                temperature=float(cfg.get("temperature", 0.05)),
+                self_normalize=_coerce_bool(cfg.get("self_normalize"), True),
+                topk_focal_k=max(0, _coerce_int(cfg.get("topk_focal_k"), 0)),
+                topk_focal_gamma=float(cfg.get("topk_focal_gamma", 1.0)),
+                max_positives=max(0, _coerce_int(cfg.get("max_positives"), 0)),
+                pi_floor=float(cfg.get("pi_floor", exposure_config.pi_min)),
+                max_weight=float(cfg.get("max_weight", 50.0)),
+                hard_negatives=torch_backend.CMCLHardNegativesConfig(
+                    k=max(0, _coerce_int(hard_cfg.get("k"), 0)),
+                    min_sim=float(hard_cfg.get("min_sim", 0.5)),
+                ),
+            )
+            cmcl_model = torch_backend.train_cmcl(
+                warm_rows,
+                warm_item_ids,
+                warm_features,
+                U,
+                user_to_idx,
+                pi_lookup,
+                cmcl_config,
+                prefer_gpu=prefer_gpu,
+            )
+            V_cold = torch_backend.infer_cmcl(
+                cmcl_model,
+                cold_features,
+                prefer_gpu=prefer_gpu,
+                batch_size=infer_batch_size,
+            )
+            scores = _score(U, V_cold)
+            metrics = _collect_metrics(scores)
+            results["cmcl"] = metrics
+
+    baseline = results.get("micm")
+    if baseline:
+        baseline_buckets = baseline.get("buckets") if isinstance(baseline, dict) else None
+        for model_name, metrics in results.items():
+            if model_name == "micm":
+                continue
+            deltas: Dict[str, object] = {}
+            for key, value in metrics.items():
+                base_value = baseline.get(key) if isinstance(baseline, dict) else None
+                if isinstance(value, (int, float)) and isinstance(base_value, (int, float)):
+                    deltas[key] = value - base_value
+            model_buckets = metrics.get("buckets") if isinstance(metrics, dict) else None
+            if baseline_buckets and isinstance(model_buckets, dict):
+                bucket_delta: Dict[str, Dict[str, Dict[str, float]]] = {}
+                for bucket_name, labels in model_buckets.items():
+                    base_labels = baseline_buckets.get(bucket_name)
+                    if not isinstance(base_labels, dict):
+                        continue
+                    label_delta: Dict[str, Dict[str, float]] = {}
+                    for label, stats in labels.items():
+                        base_stats = base_labels.get(label)
+                        if not isinstance(base_stats, dict):
+                            continue
+                        stat_delta: Dict[str, float] = {}
+                        for stat_key, stat_value in stats.items():
+                            base_stat_value = base_stats.get(stat_key)
+                            if isinstance(stat_value, (int, float)) and isinstance(base_stat_value, (int, float)):
+                                stat_delta[stat_key] = stat_value - base_stat_value
+                        if stat_delta:
+                            label_delta[label] = stat_delta
+                    if label_delta:
+                        bucket_delta[bucket_name] = label_delta
+                if bucket_delta:
+                    deltas["buckets"] = bucket_delta
+            if deltas:
+                metrics["delta_vs_micm"] = deltas
 
     if adaptive and "ctrlite" not in requested:
         print("Adaptive user refit is only available for ctrlite; skipping.")

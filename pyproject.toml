@@ -13,6 +13,7 @@ dependencies = [
     "pandas>=1.5",
     "requests>=2.31",
     "torch>=2.0",
+    "transformers>=4.40",
 ]
 
 [project.optional-dependencies]
