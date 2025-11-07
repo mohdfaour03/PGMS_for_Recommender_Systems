@@ -311,7 +311,7 @@ class CMCLConfig:
     topk_focal_gamma: float = 1.0
     max_positives: int = 0
     pi_floor: float = 0.01
-    max_weight: float = 50.0
+    max_weight: float = 10.0
     hard_negatives: CMCLHardNegativesConfig = field(default_factory=CMCLHardNegativesConfig)
 
 
@@ -683,6 +683,7 @@ class _CMCLUserDataset(torch.utils.data.Dataset):
             pi = self.pi_lookup.get(key, self.pi_floor)
             pi = max(pi, self.pi_floor)
             inv = min(1.0 / pi, self.max_weight)
+            inv = max(1.0, inv)
             weights.append(inv)
         if not weights:
             weights = [1.0]
