@@ -59,14 +59,20 @@ cmcl:
   batch_size: 128
   temperature: 0.05
   self_normalize: true
-  topk_focal_k: 3
-  topk_focal_gamma: 2.0
+  topk_focal_k: 10
+  topk_focal_gamma: 1.8
   max_positives: 24
   pi_floor: 0.01
   max_weight: 10.0
   hard_negatives:
-    k: 3
-    min_sim: 0.6
+    k: 10
+    min_sim: 0.4
+  pop_bias:
+    enable: true
+    head_frac: 0.2
+    mid_frac: 0.3
+    beta_tail: 0.05
+    gamma_pop: -0.02
   exposure:
     negatives_per_positive: 5
     hidden_dim: 64

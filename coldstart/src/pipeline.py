@@ -1,6 +1,7 @@
 """End-to-end routines for the cold-start benchmark."""
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any, Dict, Sequence
 
@@ -17,6 +18,61 @@ def _unique_item_text(interactions: Sequence[dict]) -> Dict[str, str]:
     for row in interactions:
         item_text.setdefault(row["item_id"], row["item_text"])
     return item_text
+
+
+def _popularity_quantiles(values: Sequence[int], fractions: Sequence[float]) -> list[int]:
+    if not values:
+        return [0 for _ in fractions]
+    sorted_vals = sorted(values)
+    n = len(sorted_vals)
+    thresholds: list[int] = []
+    for frac in fractions:
+        idx = min(n - 1, max(0, int(round(frac * (n - 1)))))
+        thresholds.append(sorted_vals[idx])
+    return thresholds
+
+
+def _assign_popularity_bins(
+    freq_map: Dict[str, int],
+    head_frac: float,
+    mid_frac: float,
+) -> Dict[str, str]:
+    if not freq_map:
+        return {}
+    items = sorted(freq_map.items(), key=lambda kv: kv[1], reverse=True)
+    n = len(items)
+    head_cut = max(1, int(round(head_frac * n)))
+    mid_cut = max(head_cut, int(round((head_frac + mid_frac) * n)))
+    bins: Dict[str, str] = {}
+    for idx, (item_id, _) in enumerate(items):
+        if idx < head_cut:
+            bins[item_id] = "head"
+        elif idx < mid_cut:
+            bins[item_id] = "mid"
+        else:
+            bins[item_id] = "tail"
+    return bins
+
+
+def _build_popularity_bias(
+    cold_item_ids: Sequence[str],
+    freq_map: Dict[str, int],
+    head_frac: float,
+    mid_frac: float,
+    beta_tail: float,
+    gamma_pop: float,
+) -> list[float]:
+    if not cold_item_ids:
+        return []
+    freq_bins = _assign_popularity_bins(freq_map, head_frac, mid_frac)
+    bias: list[float] = []
+    for item_id in cold_item_ids:
+        freq = freq_map.get(item_id, 0)
+        term = gamma_pop * math.log1p(freq)
+        if freq_bins.get(item_id, "tail") == "tail":
+            term += max(0.0, beta_tail)
+        bias.append(term)
+    return bias
 
 
 def _coerce_bool(value: Any, default: bool) -> bool:
@@ -604,6 +660,24 @@ def train_and_evaluate_content_model(
                 batch_size=infer_batch_size,
             )
             scores = _score(U, V_cold)
+            pop_bias_cfg = cfg.get("pop_bias", {})
+            if pop_bias_cfg.get("enable"):
+                head_frac = float(pop_bias_cfg.get("head_frac", 0.2))
+                mid_frac = float(pop_bias_cfg.get("mid_frac", 0.3))
+                beta_tail = float(pop_bias_cfg.get("beta_tail", 0.05))
+                gamma_pop = float(pop_bias_cfg.get("gamma_pop", -0.02))
+                bias_vector = _build_popularity_bias(
+                    cold_item_ids,
+                    item_popularity_counts,
+                    head_frac,
+                    mid_frac,
+                    beta_tail,
+                    gamma_pop,
+                )
+                if bias_vector:
+                    for row in scores:
+                        for idx, bias in enumerate(bias_vector):
+                            row[idx] += bias
             metrics = _collect_metrics(scores)
             results["cmcl"] = metrics
 
