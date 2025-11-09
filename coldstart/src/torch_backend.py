@@ -312,6 +312,18 @@ class CMCLConfig:
     max_positives: int = 0
     pi_floor: float = 0.01
     max_weight: float = 10.0
+    encoder_lr: float | None = None
+    head_lr: float | None = None
+    weight_decay: float | None = None
+    proj_hidden_dim: int = 512
+    dropout: float = 0.1
+    grad_alert_patience: int = 5
+    log_interval: int = 10
+    text_log_batches: int = 5
+    sampled_negatives: int = 256
+    neg_sampler_seed: int = 17
+    margin_m: float = 0.1
+    margin_alpha: float = 0.05
     hard_negatives: CMCLHardNegativesConfig = field(default_factory=CMCLHardNegativesConfig)
 
 
@@ -638,12 +650,29 @@ def infer_micm(
 
 
 class CMCLModel(nn.Module):
-    def __init__(self, n_features: int, n_factors: int) -> None:
+    def __init__(self, n_features: int, n_factors: int, hidden_dim: int = 512, dropout: float = 0.1) -> None:
         super().__init__()
-        self.proj = nn.Linear(n_features, n_factors, bias=False)
+        hidden_dim = max(hidden_dim, n_factors)
+        self.item_encoder = nn.Sequential(
+            nn.Linear(n_features, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, n_factors),
+        )
+        self.user_adapter = nn.Sequential(
+            nn.LayerNorm(n_factors),
+            nn.Linear(n_factors, n_factors),
+        )
+
+    def encode_items(self, x: torch.Tensor) -> torch.Tensor:
+        return self.item_encoder(x)
+
+    def encode_users(self, user_vectors: torch.Tensor) -> torch.Tensor:
+        return self.user_adapter(user_vectors)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.proj(x)
+        return self.encode_items(x)
 
 
 class _CMCLUserDataset(torch.utils.data.Dataset):
@@ -696,6 +725,8 @@ def _cmcl_collate_fn(
     item_ids: Sequence[str],
     semantic_neighbors: Dict[str, List[str]] | None,
     hard_neg_k: int,
+    negative_sampler: _ExposureNegativeSampler | None,
+    sampled_negatives: int,
 ):
     item_index = {item_id: idx for idx, item_id in enumerate(item_ids)}
 
@@ -708,6 +739,7 @@ def _cmcl_collate_fn(
         torch.Tensor,
         List[torch.Tensor],
         List[torch.Tensor],
+        torch.Tensor,
     ]:
         user_ids = [entry[0] for entry in batch]
         user_vecs = torch.stack([entry[1] for entry in batch], dim=0)
@@ -721,6 +753,8 @@ def _cmcl_collate_fn(
                 for item in items:
                     for neighbor in semantic_neighbors.get(item, [])[:hard_neg_k]:
                         batch_items.add(neighbor)
+        if negative_sampler and sampled_negatives > 0:
+            batch_items.update(negative_sampler.sample(sampled_negatives))
         ordered = [item for item in sorted(batch_items) if item in item_index]
         if not ordered:
             ordered = [sorted(item_index.keys())[0]]
@@ -745,7 +779,24 @@ def _cmcl_collate_fn(
             positive_indices.append(torch.tensor(idxs, dtype=torch.long))
             remapped_weights.append(torch.tensor(vals, dtype=torch.float32))
 
-        return user_ids, user_vecs, ordered, item_features, positive_indices, remapped_weights
+        if negative_sampler:
+            log_probs = [
+                math.log(max(negative_sampler.prob(item), 1e-6)) for item in ordered
+            ]
+        else:
+            uniform = 1.0 / max(len(item_ids), 1)
+            log_probs = [math.log(uniform) for _ in ordered]
+        item_log_probs = torch.tensor(log_probs, dtype=torch.float32)
+
+        return (
+            user_ids,
+            user_vecs,
+            ordered,
+            item_features,
+            positive_indices,
+            remapped_weights,
+            item_log_probs,
+        )
 
     return _collate
 
@@ -758,8 +809,14 @@ def _cmcl_loss(
     self_normalize: bool,
     topk_focal_k: int,
     topk_focal_gamma: float,
+    item_log_probs: torch.Tensor | None,
+    margin_m: float,
+    margin_alpha: float,
 ) -> torch.Tensor:
-    log_denom = torch.logsumexp(logits, dim=1)
+    adjusted_logits = logits
+    if item_log_probs is not None:
+        adjusted_logits = logits - item_log_probs.unsqueeze(0)
+    log_denom = torch.logsumexp(adjusted_logits, dim=1)
     total = logits.new_tensor(0.0)
     total_weight = logits.new_tensor(0.0)
     for row_idx, cols in enumerate(positive_indices):
@@ -771,7 +828,7 @@ def _cmcl_loss(
             continue
         if self_normalize:
             weights = weights / weights.sum().clamp_min(1e-6)
-        pos_logits = logits[row_idx].index_select(0, cols)
+        pos_logits = adjusted_logits[row_idx].index_select(0, cols)
         if topk_focal_k > 0 and pos_logits.numel() > 0:
             sorted_vals, _ = torch.sort(pos_logits, descending=True)
             kth_idx = min(topk_focal_k - 1, sorted_vals.numel() - 1)
@@ -783,7 +840,29 @@ def _cmcl_loss(
                 weights = weights / weights.sum().clamp_min(1e-6)
         total += -(weights * (pos_logits - log_denom[row_idx])).sum()
         total_weight += weights.sum()
-    return total / total_weight.clamp_min(1e-6)
+    loss = total / total_weight.clamp_min(1e-6)
+    if margin_m > 0:
+        margin_losses: List[torch.Tensor] = []
+        for row_idx, cols in enumerate(positive_indices):
+            if cols.numel() == 0:
+                continue
+            neg_mask = torch.ones(logits.size(1), dtype=torch.bool, device=logits.device)
+            neg_mask[cols] = False
+            if not neg_mask.any():
+                continue
+            neg_scores = logits[row_idx][neg_mask]
+            if neg_scores.numel() == 0:
+                continue
+            pos_scores = logits[row_idx].index_select(0, cols.to(logits.device))
+            margin_targets = logits.new_full((neg_scores.numel(),), margin_m)
+            if margin_alpha > 0 and item_log_probs is not None:
+                neg_log_probs = item_log_probs[neg_mask]
+                margin_targets = margin_targets - margin_alpha * neg_log_probs
+            margin_term = margin_targets.unsqueeze(0) - (pos_scores.unsqueeze(1) - neg_scores.unsqueeze(0))
+            margin_losses.append(torch.relu(margin_term).mean())
+        if margin_losses:
+            loss = loss + torch.stack(margin_losses).mean()
+    return loss
 
 
 def _build_semantic_neighbors(
@@ -816,6 +895,48 @@ def _build_semantic_neighbors(
     return neighbors
 
 
+class _ExposureNegativeSampler:
+    def __init__(
+        self,
+        item_ids: Sequence[str],
+        item_probs: Dict[str, float],
+        pi_floor: float,
+        seed: int,
+    ) -> None:
+        self.items = list(item_ids)
+        self.pi_floor = pi_floor
+        self.prob_map = {
+            item: max(pi_floor, float(item_probs.get(item, pi_floor))) for item in self.items
+        }
+        self.weights = [self.prob_map[item] for item in self.items]
+        self.rng = random.Random(seed)
+
+    def sample(self, k: int) -> List[str]:
+        if not self.items or k <= 0:
+            return []
+        return self.rng.choices(self.items, weights=self.weights, k=k)
+
+    def prob(self, item: str) -> float:
+        return self.prob_map.get(item, self.pi_floor)
+
+
+def aggregate_item_exposure(pi_lookup: Dict[str, float], pi_floor: float) -> Dict[str, float]:
+    sums: Dict[str, float] = {}
+    counts: Dict[str, int] = {}
+    for key, value in pi_lookup.items():
+        if "::" in key:
+            _, item = key.split("::", 1)
+        else:
+            item = key
+        sums[item] = sums.get(item, 0.0) + float(value)
+        counts[item] = counts.get(item, 0) + 1
+    exposures: Dict[str, float] = {}
+    for item, total in sums.items():
+        denom = max(counts.get(item, 1), 1)
+        exposures[item] = max(pi_floor, total / denom)
+    return exposures
+
+
 def train_cmcl(
     warm_rows: Sequence[dict],
     warm_item_ids: Sequence[str],
@@ -824,6 +945,9 @@ def train_cmcl(
     user_to_idx: Dict[str, int],
     pi_lookup: Dict[str, float],
     config: CMCLConfig,
+    text_len_lookup: Dict[str, int] | None = None,
+    text_bucket_lookup: Dict[str, str] | None = None,
+    item_exposure: Dict[str, float] | None = None,
     prefer_gpu: bool = True,
 ) -> CMCLModel:
     device = _torch_device(prefer_gpu)
@@ -872,11 +996,22 @@ def train_cmcl(
         semantic_neighbors = _build_semantic_neighbors(
             warm_features, warm_item_ids, config.hard_negatives.k, config.hard_negatives.min_sim
         )
+    exposure_map = item_exposure or aggregate_item_exposure(pi_lookup, config.pi_floor)
+    negative_sampler = None
+    if config.sampled_negatives > 0:
+        negative_sampler = _ExposureNegativeSampler(
+            warm_item_ids,
+            exposure_map,
+            config.pi_floor,
+            config.neg_sampler_seed,
+        )
     collate = _cmcl_collate_fn(
         feature_tensor,
         warm_item_ids,
         semantic_neighbors,
         config.hard_negatives.k,
+        negative_sampler,
+        config.sampled_negatives,
     )
     loader = torch.utils.data.DataLoader(
         dataset,
@@ -885,24 +1020,63 @@ def train_cmcl(
         drop_last=False,
         collate_fn=collate,
     )
-    model = CMCLModel(len(warm_features[0]), len(user_factors[0])).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr, weight_decay=config.reg)
+    model = CMCLModel(
+        len(warm_features[0]),
+        len(user_factors[0]),
+        hidden_dim=config.proj_hidden_dim,
+        dropout=config.dropout,
+    ).to(device)
+    encoder_lr = config.encoder_lr or config.lr
+    head_lr = config.head_lr or max(config.lr * 2.0, config.lr)
+    weight_decay = config.weight_decay if config.weight_decay is not None else config.reg
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": model.item_encoder.parameters(), "lr": encoder_lr},
+            {"params": model.user_adapter.parameters(), "lr": head_lr},
+        ],
+        weight_decay=weight_decay,
+    )
+    stagnant_counts: Dict[str, int] = {}
+    bucket_map = text_bucket_lookup or {}
+
+    def _log_batch_text_lengths(batch_index: int, batch_items: Sequence[str]) -> None:
+        if not text_len_lookup:
+            return
+        stats: Dict[str, List[int]] = {}
+        for item in batch_items:
+            bucket = bucket_map.get(item, "all")
+            stats.setdefault(bucket, []).append(int(text_len_lookup.get(item, 0)))
+        for bucket, values in stats.items():
+            if not values:
+                continue
+            zero_pct = sum(1 for val in values if val <= 0) / len(values) * 100.0
+            mean_len = sum(values) / len(values)
+            print(
+                f"[cmcl] dataloader batch={batch_index} bucket={bucket}: "
+                f"mean_tokens={mean_len:.1f} zero_pct={zero_pct:.2f}%"
+            )
 
     for epoch in range(config.iters):
         epoch_loss = 0.0
         batches = 0
-        for (
+        grad_history: Dict[str, List[float]] = {}
+        for batch_idx, (
             _,
             user_vecs,
-            _,
+            batch_items,
             item_features,
             pos_indices,
             pos_weights,
-        ) in loader:
+            item_log_probs,
+        ) in enumerate(loader):
+            if config.text_log_batches and batch_idx < config.text_log_batches:
+                _log_batch_text_lengths(batch_idx + 1, batch_items)
             user_vecs = user_vecs.to(device)
             item_features = item_features.to(device)
-            projected = model(item_features)
-            logits = user_vecs @ projected.T
+            item_log_probs = item_log_probs.to(device)
+            adapted_users = model.encode_users(user_vecs)
+            projected = model.encode_items(item_features)
+            logits = adapted_users @ projected.T
             logits = logits / max(config.temperature, 1e-6)
             loss = _cmcl_loss(
                 logits,
@@ -912,14 +1086,61 @@ def train_cmcl(
                 config.self_normalize,
                 config.topk_focal_k,
                 config.topk_focal_gamma,
+                item_log_probs,
+                config.margin_m,
+                config.margin_alpha,
             )
             optimizer.zero_grad()
             loss.backward()
+            batch_grad_norms: Dict[str, float] = {}
+            for name, param in model.named_parameters():
+                if param.grad is None:
+                    continue
+                grad_norm = float(param.grad.data.norm(2).item())
+                batch_grad_norms[name] = grad_norm
+                if grad_norm < 1e-8:
+                    stagnant_counts[name] = stagnant_counts.get(name, 0) + 1
+                else:
+                    stagnant_counts[name] = 0
+            patience = max(1, config.grad_alert_patience)
+            stalled = [name for name, count in stagnant_counts.items() if count >= patience]
+            if stalled:
+                raise RuntimeError(
+                    f"[cmcl] zero gradients detected for {stalled} across {patience} consecutive steps."
+                )
+            for name, norm_val in batch_grad_norms.items():
+                grad_history.setdefault(name, []).append(norm_val)
+            if batches == 0:
+                flat_parts = [w.flatten() for w in pos_weights if w.numel() > 0]
+                if flat_parts:
+                    flat_weights = torch.cat(flat_parts, dim=0)
+                    print(
+                        "[cmcl] exposure weights stats: "
+                        f"min={float(flat_weights.min()):.4f}, "
+                        f"max={float(flat_weights.max()):.4f}, "
+                        f"mean={float(flat_weights.mean()):.4f}, "
+                        f"sample={flat_weights[: min(5, flat_weights.shape[0])].tolist()}"
+                    )
             optimizer.step()
             epoch_loss += float(loss.detach().cpu())
             batches += 1
+            if config.log_interval and batches % config.log_interval == 0:
+                latest_norms = {
+                    name: norms[-1] if norms else 0.0 for name, norms in grad_history.items()
+                }
+                print(
+                    f"[cmcl] epoch {epoch + 1} batch {batches}: "
+                    f"loss={float(loss.detach().cpu()):.4f} grad_norms={latest_norms}"
+                )
         if batches:
-            print(f"[cmcl] epoch {epoch + 1}/{config.iters}: loss={epoch_loss / batches:.4f}")
+            epoch_grad_summary = {
+                name: sum(norms) / max(len(norms), 1) for name, norms in grad_history.items()
+            }
+            print(
+                f"[cmcl] epoch {epoch + 1}/{config.iters}: "
+                f"loss={epoch_loss / batches:.4f} "
+                f"grad_norms={epoch_grad_summary}"
+            )
     return model.cpu()
 
 
@@ -940,8 +1161,31 @@ def infer_cmcl(
                 dtype=torch.float32,
                 device=device,
             )
-            preds = model(batch)
+            preds = model.encode_items(batch)
             outputs.extend(preds.cpu().numpy().tolist())
+    model.cpu()
+    return outputs
+
+
+def adapt_users_with_cmcl(
+    model: CMCLModel,
+    user_factors: List[List[float]],
+    prefer_gpu: bool = True,
+    batch_size: int = 4096,
+) -> List[List[float]]:
+    device = _torch_device(prefer_gpu)
+    model = model.to(device)
+    model.eval()
+    outputs: List[List[float]] = []
+    with torch.no_grad():
+        for start in range(0, len(user_factors), batch_size):
+            batch = torch.tensor(
+                user_factors[start : start + batch_size],
+                dtype=torch.float32,
+                device=device,
+            )
+            adapted = model.encode_users(batch)
+            outputs.extend(adapted.cpu().numpy().tolist())
     model.cpu()
     return outputs
 
@@ -1163,6 +1407,9 @@ __all__ = [
     "CMCLConfig",
     "train_cmcl",
     "infer_cmcl",
+    "adapt_users_with_cmcl",
+    "aggregate_item_exposure",
+    "adapt_users_with_cmcl",
     "CDLTorchConfig",
     "train_cdl",
     "infer_cdl",

@@ -54,6 +54,93 @@ def _assign_popularity_bins(
     return bins
 
 
+def _quantile_thresholds(values: Sequence[int], fractions: Sequence[float]) -> list[int]:
+    if not values:
+        return []
+    sorted_vals = sorted(values)
+    n = len(sorted_vals)
+    thresholds: list[int] = []
+    for frac in fractions:
+        if n == 1:
+            thresholds.append(sorted_vals[0])
+            continue
+        idx = min(n - 1, max(0, int(round(frac * (n - 1)))))
+        thresholds.append(sorted_vals[idx])
+    return thresholds
+
+
+def _assign_bucket(value: int, thresholds: Sequence[int], labels: Sequence[str]) -> str:
+    if not labels:
+        return "all"
+    for threshold, label in zip(thresholds, labels):
+        if value <= threshold:
+            return label
+    return labels[-1]
+
+
+def _token_count(text: str | None) -> int:
+    if not text:
+        return 0
+    return len([token for token in text.split() if token])
+
+
+def _log_bucket_text_coverage(
+    tag: str,
+    item_ids: Sequence[str],
+    text_lookup: Dict[str, str],
+    bucket_lookup: Dict[str, str],
+) -> None:
+    if not item_ids:
+        return
+    stats: Dict[str, Dict[str, int]] = {}
+    for item_id in item_ids:
+        bucket = bucket_lookup.get(item_id, "unknown")
+        entry = stats.setdefault(bucket, {"total": 0, "non_empty": 0})
+        entry["total"] += 1
+        if _token_count(text_lookup.get(item_id)) > 0:
+            entry["non_empty"] += 1
+    for bucket, entry in sorted(stats.items()):
+        total = entry["total"]
+        if total <= 0:
+            continue
+        pct = entry["non_empty"] / total * 100.0
+        print(f"[text] {tag} bucket={bucket}: non_empty={entry['non_empty']}/{total} ({pct:.2f}%)")
+
+
+def _log_tokenizer_bucket_stats(featurizer: object, tag: str) -> None:
+    length_getter = getattr(featurizer, "get_last_token_lengths", None)
+    if not callable(length_getter):
+        return
+    lengths = length_getter()
+    if not lengths:
+        return
+    bucket_getter = getattr(featurizer, "get_last_token_buckets", None)
+    buckets: Sequence[str] = []
+    if callable(bucket_getter):
+        buckets = bucket_getter()
+    if not buckets:
+        buckets = ["all"] * len(lengths)
+    stats: Dict[str, Dict[str, float]] = {}
+    for length, bucket in zip(lengths, buckets):
+        content = max(length - 2, 0)
+        entry = stats.setdefault(bucket or "unknown", {"total": 0.0, "sum": 0.0, "non_empty": 0.0})
+        entry["total"] += 1.0
+        entry["sum"] += content
+        if content > 0:
+            entry["non_empty"] += 1.0
+    max_tokens = getattr(featurizer, "max_length", "n/a")
+    for bucket, entry in sorted(stats.items()):
+        total = entry["total"]
+        if total <= 0:
+            continue
+        mean_len = entry["sum"] / total
+        pct = entry["non_empty"] / total * 100.0
+        print(
+            f"[text] {tag} bucket={bucket}: "
+            f"mean_tokens={mean_len:.1f} non_empty_pct={pct:.2f}% max_seq_len={max_tokens}"
+        )
+
+
 def _build_popularity_bias(
     cold_item_ids: Sequence[str],
     freq_map: Dict[str, int],
@@ -145,13 +232,54 @@ def prepare_dataset(
     val_item_ids = sorted(val_item_text)
     cold_item_ids = sorted(cold_item_text)
 
+    text_len_lookup: Dict[str, int] = {}
+    for source in (warm_rows, val_rows, cold_rows):
+        for row in source:
+            text_len = row.get("text_len")
+            if text_len is None:
+                continue
+            item_id = row["item_id"]
+            if item_id not in text_len_lookup:
+                text_len_lookup[item_id] = int(text_len)
+    text_thresholds = _quantile_thresholds(list(text_len_lookup.values()), (0.33, 0.66))
+    text_labels = ["short", "medium", "long"]
+    all_item_ids = warm_item_ids + val_item_ids + cold_item_ids
+    text_bucket_lookup = {
+        item_id: _assign_bucket(text_len_lookup.get(item_id, 0), text_thresholds, text_labels)
+        for item_id in all_item_ids
+    }
+    _log_bucket_text_coverage("warm_text", warm_item_ids, warm_item_text, text_bucket_lookup)
+    _log_bucket_text_coverage("cold_text", cold_item_ids, cold_item_text, text_bucket_lookup)
+
     encoder_kwargs = dict(encoder_params or tfidf_params or {})
     featurizer = build_text_featurizer(encoder_type, encoder_kwargs)
     warm_texts = [warm_item_text[item] for item in warm_item_ids]
-    warm_features = featurizer.fit_transform_warm(warm_texts)
-    val_features = featurizer.transform([val_item_text[item] for item in val_item_ids]) if val_item_ids else []
+    warm_bucket_ids = [text_bucket_lookup.get(item, "unknown") for item in warm_item_ids]
+    warm_features = featurizer.fit_transform_warm(
+        warm_texts,
+        bucket_ids=warm_bucket_ids,
+        log_prefix="[text][warm]",
+    )
+    _log_tokenizer_bucket_stats(featurizer, "warm_tokenized")
+    if val_item_ids:
+        val_bucket_ids = [text_bucket_lookup.get(item, "unknown") for item in val_item_ids]
+        val_texts = [val_item_text[item] for item in val_item_ids]
+        val_features = featurizer.transform(
+            val_texts,
+            bucket_ids=val_bucket_ids,
+            log_prefix="[text][val]",
+        )
+        _log_tokenizer_bucket_stats(featurizer, "val_tokenized")
+    else:
+        val_features = []
     cold_texts = [cold_item_text[item] for item in cold_item_ids]
-    cold_features = featurizer.transform(cold_texts)
+    cold_bucket_ids = [text_bucket_lookup.get(item, "unknown") for item in cold_item_ids]
+    cold_features = featurizer.transform(
+        cold_texts,
+        bucket_ids=cold_bucket_ids,
+        log_prefix="[text][cold]",
+    )
+    _log_tokenizer_bucket_stats(featurizer, "cold_tokenized")
     print(f"Warm text features shape: ({len(warm_features)}, {len(warm_features[0]) if warm_features else 0})")
     if val_features:
         print(f"Val text features shape: ({len(val_features)}, {len(val_features[0])})")
@@ -227,6 +355,26 @@ def train_and_evaluate_content_model(
     cold_item_ids = data_io.load_json(data_path / "cold_item_ids.json")
     warm_features = data_io.load_matrix(data_path / "warm_item_text_features.json")
     cold_features = data_io.load_matrix(data_path / "cold_item_text_features.json")
+    warm_item_text = _unique_item_text(warm_rows)
+    cold_item_text = _unique_item_text(cold_rows)
+    text_len_lookup: Dict[str, int] = {}
+    for source in (warm_rows, cold_rows):
+        for row in source:
+            text_len = row.get("text_len")
+            if text_len is None:
+                continue
+            item_id = row["item_id"]
+            if item_id not in text_len_lookup:
+                text_len_lookup[item_id] = int(text_len)
+    text_thresholds = _quantile_thresholds(list(text_len_lookup.values()), (0.33, 0.66))
+    text_labels = ["short", "medium", "long"]
+    all_item_ids = warm_item_ids + cold_item_ids
+    text_bucket_lookup = {
+        item_id: _assign_bucket(text_len_lookup.get(item_id, 0), text_thresholds, text_labels)
+        for item_id in all_item_ids
+    }
+    _log_bucket_text_coverage("warm_text", warm_item_ids, warm_item_text, text_bucket_lookup)
+    _log_bucket_text_coverage("cold_text", cold_item_ids, cold_item_text, text_bucket_lookup)
 
     if isinstance(k_eval, int):
         eval_ks = [k_eval]
@@ -307,12 +455,9 @@ def train_and_evaluate_content_model(
         item_popularity_counts[row["item_id"]] = item_popularity_counts.get(row["item_id"], 0) + 1
     for row in cold_rows:
         item_popularity_counts[row["item_id"]] = item_popularity_counts.get(row["item_id"], 0) + 1
-    item_text_len_map: Dict[str, int] = {}
-    for row in cold_rows:
-        text_len_value = row.get("text_len")
-        if text_len_value is None:
-            continue
-        item_text_len_map[row["item_id"]] = int(text_len_value)
+    item_text_len_map: Dict[str, int] = {
+        item_id: text_len_lookup.get(item_id, 0) for item_id in cold_item_ids if item_id in text_len_lookup
+    }
 
     def _collect_metrics(score_matrix: list[list[float]]) -> Dict[str, object]:
         metrics: Dict[str, object] = {}
@@ -638,11 +783,24 @@ def train_and_evaluate_content_model(
                 max_positives=max(0, _coerce_int(cfg.get("max_positives"), 0)),
                 pi_floor=float(cfg.get("pi_floor", exposure_config.pi_min)),
                 max_weight=float(cfg.get("max_weight", 50.0)),
+                encoder_lr=_coerce_optional_float(cfg.get("encoder_lr")),
+                head_lr=_coerce_optional_float(cfg.get("head_lr")),
+                weight_decay=_coerce_optional_float(cfg.get("weight_decay")),
+                proj_hidden_dim=max(32, _coerce_int(cfg.get("proj_hidden_dim"), 512)),
+                dropout=float(cfg.get("dropout", 0.1)),
+                grad_alert_patience=max(1, _coerce_int(cfg.get("grad_alert_patience"), 5)),
+                log_interval=max(0, _coerce_int(cfg.get("log_interval"), 10)),
+                text_log_batches=max(0, _coerce_int(cfg.get("text_log_batches"), 5)),
+                sampled_negatives=max(0, _coerce_int(cfg.get("sampled_negatives"), 256)),
+                neg_sampler_seed=_coerce_int(cfg.get("neg_sampler_seed"), seed),
+                margin_m=float(cfg.get("margin_m", 0.1)),
+                margin_alpha=float(cfg.get("margin_alpha", 0.05)),
                 hard_negatives=torch_backend.CMCLHardNegativesConfig(
                     k=max(0, _coerce_int(hard_cfg.get("k"), 0)),
                     min_sim=float(hard_cfg.get("min_sim", 0.5)),
                 ),
             )
+            item_exposure = torch_backend.aggregate_item_exposure(pi_lookup, cmcl_config.pi_floor)
             cmcl_model = torch_backend.train_cmcl(
                 warm_rows,
                 warm_item_ids,
@@ -651,6 +809,9 @@ def train_and_evaluate_content_model(
                 user_to_idx,
                 pi_lookup,
                 cmcl_config,
+                text_len_lookup,
+                text_bucket_lookup,
+                item_exposure,
                 prefer_gpu=prefer_gpu,
             )
             V_cold = torch_backend.infer_cmcl(
@@ -659,7 +820,13 @@ def train_and_evaluate_content_model(
                 prefer_gpu=prefer_gpu,
                 batch_size=infer_batch_size,
             )
-            scores = _score(U, V_cold)
+            adapted_users = torch_backend.adapt_users_with_cmcl(
+                cmcl_model,
+                U,
+                prefer_gpu=prefer_gpu,
+                batch_size=score_batch_size,
+            )
+            scores = _score(adapted_users, V_cold)
             pop_bias_cfg = cfg.get("pop_bias", {})
             if pop_bias_cfg.get("enable"):
                 head_frac = float(pop_bias_cfg.get("head_frac", 0.2))

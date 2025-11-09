@@ -115,14 +115,14 @@ class TfidfTextFeaturizer:
             max_features=max_features, min_df=min_df, ngram_range=ngram_range
         )
 
-    def fit_warm(self, item_texts: Sequence[str]) -> None:
+    def fit_warm(self, item_texts: Sequence[str], **_: object) -> None:
         print("TF-IDF fit on warm only")
         self.vectorizer.fit(item_texts)
 
-    def transform(self, item_texts: Sequence[str]) -> List[List[float]]:
+    def transform(self, item_texts: Sequence[str], **_: object) -> List[List[float]]:
         return self.vectorizer.transform(item_texts)
 
-    def fit_transform_warm(self, item_texts: Sequence[str]) -> List[List[float]]:
+    def fit_transform_warm(self, item_texts: Sequence[str], **_: object) -> List[List[float]]:
         print("TF-IDF fit on warm only")
         return self.vectorizer.fit_transform(item_texts)
 
@@ -153,17 +153,19 @@ class FrozenBertLinearFeaturizer:
         self,
         model_name: str = "bert-base-uncased",
         batch_size: int = 32,
-        max_length: int = 64,
-        pooling: str = "cls",
+        max_length: int = 128,
+        pooling: str = "mean",
         proj_dim: int | None = 256,
         device: str | None = None,
+        log_batch_stats_every: int = 0,
     ) -> None:
         if torch is None or AutoModel is None or AutoTokenizer is None:  # pragma: no cover - dynamic import
             raise ImportError("transformers and torch are required for frozen_bert_linear.")
         self.model_name = model_name
         self.batch_size = max(1, batch_size)
         self.max_length = max(8, max_length)
-        self.pooling = pooling if pooling in {"cls", "mean"} else "cls"
+        valid_pooling = {"cls", "mean", "cls_mean"}
+        self.pooling = pooling if pooling in valid_pooling else "mean"
         self.proj_dim = proj_dim
         self.device_name = device
         self._tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -179,26 +181,80 @@ class FrozenBertLinearFeaturizer:
         self._model.to(self._device)
         self._mean: torch.Tensor | None = None
         self._proj: torch.Tensor | None = None
+        self._last_token_lengths: List[float] = []
+        self._last_token_buckets: List[str] = []
+        self._log_batch_stats_every = max(0, int(log_batch_stats_every))
 
-    def _embed(self, item_texts: Sequence[str]) -> torch.Tensor:
+    def _log_batch_stats(
+        self,
+        log_prefix: str,
+        batch_index: int,
+        token_lengths: torch.Tensor,
+        bucket_ids: Sequence[str] | None,
+    ) -> None:
+        content_lengths = torch.clamp(token_lengths - 2, min=0).to(torch.float32)
+        if content_lengths.numel() == 0:
+            return
+        labels = list(bucket_ids) if bucket_ids is not None else ["all"] * content_lengths.shape[0]
+        bucket_to_lengths: dict[str, List[float]] = {}
+        for length, label in zip(content_lengths.tolist(), labels):
+            bucket_to_lengths.setdefault(label or "unknown", []).append(length)
+        for bucket, values in bucket_to_lengths.items():
+            mean_len = sum(values) / max(len(values), 1)
+            zero_pct = sum(1 for val in values if val <= 0.0) / max(len(values), 1) * 100.0
+            print(
+                f"[text] {log_prefix} batch={batch_index} bucket={bucket} "
+                f"mean_tokens={mean_len:.1f} zero_pct={zero_pct:.2f}% "
+                f"max_seq_len={self.max_length}"
+            )
+
+    def _embed(
+        self,
+        item_texts: Sequence[str],
+        bucket_ids: Sequence[str] | None = None,
+        log_prefix: str = "[text]",
+    ) -> torch.Tensor:
+        self._last_token_lengths = []
+        self._last_token_buckets = []
         outputs: List[torch.Tensor] = []
+        all_buckets = list(bucket_ids) if bucket_ids is not None else None
         for start in range(0, len(item_texts), self.batch_size):
             batch = [text or "" for text in item_texts[start : start + self.batch_size]]
+            batch_bucket = (
+                all_buckets[start : start + self.batch_size] if all_buckets is not None else None
+            )
             encoded = self._tokenizer(
                 batch,
-                padding=True,
-                truncation=True,
+                padding="max_length",
+                truncation="longest_first",
                 max_length=self.max_length,
                 return_tensors="pt",
             )
             encoded = {key: value.to(self._device) for key, value in encoded.items()}
+            token_lengths = encoded["attention_mask"].sum(dim=1)
+            self._last_token_lengths.extend(token_lengths.tolist())
+            if batch_bucket is not None:
+                self._last_token_buckets.extend(batch_bucket)
             with torch.no_grad():
                 result = self._model(**encoded)
                 hidden = result.last_hidden_state
-                if self.pooling == "mean":
-                    pooled = hidden.mean(dim=1)
+                if self.pooling == "cls":
+                    pooled_cls = hidden[:, 0, :]
+                    pooled = pooled_cls
                 else:
-                    pooled = hidden[:, 0, :]
+                    mask = encoded["attention_mask"].unsqueeze(-1)
+                    mask = mask.to(hidden.dtype)
+                    summed = (hidden * mask).sum(dim=1)
+                    counts = mask.sum(dim=1).clamp_min(1.0)
+                    pooled_mean = summed / counts
+                    if self.pooling == "cls_mean":
+                        pooled = torch.cat([pooled_mean, hidden[:, 0, :]], dim=1)
+                    else:
+                        pooled = pooled_mean
+            if self._log_batch_stats_every and (
+                (start // self.batch_size) % self._log_batch_stats_every == 0
+            ):
+                self._log_batch_stats(log_prefix, start // self.batch_size, token_lengths, batch_bucket)
             outputs.append(pooled.cpu())
         if not outputs:
             return torch.zeros((0, self._model.config.hidden_size))
@@ -221,19 +277,43 @@ class FrozenBertLinearFeaturizer:
             return centered @ self._proj
         return centered
 
-    def fit_warm(self, item_texts: Sequence[str]) -> None:
-        embeddings = self._embed(item_texts)
+    def fit_warm(
+        self,
+        item_texts: Sequence[str],
+        *,
+        bucket_ids: Sequence[str] | None = None,
+        log_prefix: str = "[text][warm]",
+    ) -> None:
+        embeddings = self._embed(item_texts, bucket_ids=bucket_ids, log_prefix=log_prefix)
         _ = self._project_embeddings(embeddings, fit=True)
 
-    def transform(self, item_texts: Sequence[str]) -> List[List[float]]:
-        embeddings = self._embed(item_texts)
+    def transform(
+        self,
+        item_texts: Sequence[str],
+        *,
+        bucket_ids: Sequence[str] | None = None,
+        log_prefix: str = "[text][transform]",
+    ) -> List[List[float]]:
+        embeddings = self._embed(item_texts, bucket_ids=bucket_ids, log_prefix=log_prefix)
         projected = self._project_embeddings(embeddings, fit=False)
         return projected.numpy().tolist()
 
-    def fit_transform_warm(self, item_texts: Sequence[str]) -> List[List[float]]:
-        embeddings = self._embed(item_texts)
+    def fit_transform_warm(
+        self,
+        item_texts: Sequence[str],
+        *,
+        bucket_ids: Sequence[str] | None = None,
+        log_prefix: str = "[text][warm_fit_transform]",
+    ) -> List[List[float]]:
+        embeddings = self._embed(item_texts, bucket_ids=bucket_ids, log_prefix=log_prefix)
         projected = self._project_embeddings(embeddings, fit=True)
         return projected.numpy().tolist()
+
+    def get_last_token_lengths(self) -> List[float]:
+        return list(self._last_token_lengths)
+
+    def get_last_token_buckets(self) -> List[str]:
+        return list(self._last_token_buckets)
 
     def save_state(self) -> dict:
         if self._mean is None:
