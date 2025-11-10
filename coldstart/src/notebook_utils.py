@@ -23,14 +23,14 @@ import urllib.request
 
 MOVIELENS_SMALL_URL = "https://files.grouplens.org/datasets/movielens/ml-latest-small.zip"
 MOVIELENS_MEDIUM_URL = "https://files.grouplens.org/datasets/movielens/ml-latest.zip"
+_AMAZON_BASE = "https://datarepo.eng.ucsd.edu/mcauley_group/data/amazon_v2/categoryFilesSmall"
 AMAZON_DATASETS = {
-    # Lightweight category files released by UCSD (review subsets).
-    "beauty": "https://jmcauley.ucsd.edu/data/amazon_v2/categoryFilesSmall/Beauty.json.gz",
-    "baby": "https://jmcauley.ucsd.edu/data/amazon_v2/categoryFilesSmall/Baby.json.gz",
-    "sports": "https://jmcauley.ucsd.edu/data/amazon_v2/categoryFilesSmall/Sports_and_Outdoors.json.gz",
-    "electronics": "https://jmcauley.ucsd.edu/data/amazon_v2/categoryFilesSmall/Electronics.json.gz",
-    "home": "https://jmcauley.ucsd.edu/data/amazon_v2/categoryFilesSmall/Home_and_Kitchen.json.gz",
-    "digital_music": "https://jmcauley.ucsd.edu/data/amazon_v2/categoryFilesSmall/Digital_Music.json.gz",
+    "beauty": f"{_AMAZON_BASE}/Beauty.json.gz",
+    "baby": f"{_AMAZON_BASE}/Baby.json.gz",
+    "sports": f"{_AMAZON_BASE}/Sports_and_Outdoors.json.gz",
+    "electronics": f"{_AMAZON_BASE}/Electronics.json.gz",
+    "home": f"{_AMAZON_BASE}/Home_and_Kitchen.json.gz",
+    "digital_music": f"{_AMAZON_BASE}/Digital_Music.json.gz",
 }
 _YEAR_SUFFIX = re.compile(r"\s*\((\d{4})\)\s*$")
 _MULTISPACE = re.compile(r"\s+")
