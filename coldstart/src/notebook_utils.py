@@ -17,6 +17,8 @@ from typing import Any, Dict
 import pandas as pd
 import requests
 from requests import exceptions as requests_exceptions
+import ssl
+import urllib.request
 
 
 MOVIELENS_SMALL_URL = "https://files.grouplens.org/datasets/movielens/ml-latest-small.zip"
@@ -91,9 +93,30 @@ def _http_get(url: str, *, timeout: int, stream: bool = False) -> requests.Respo
             f"[notebook_utils] SSL verification failed for {url}; retrying without verification."
         )
         requests.packages.urllib3.disable_warnings()  # type: ignore[attr-defined]
-        response = requests.get(url, timeout=timeout, stream=stream, verify=False)
-        response.raise_for_status()
-        return response
+        try:
+            response = requests.get(url, timeout=timeout, stream=stream, verify=False)
+            response.raise_for_status()
+            return response
+        except requests_exceptions.RequestException:
+            print("[notebook_utils] requests fallback failed; using urllib without SSL.")
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            with urllib.request.urlopen(url, timeout=timeout, context=context) as handle:
+                data = handle.read()
+
+            class _InlineResponse:
+                def __init__(self, payload: bytes) -> None:
+                    self.content = payload
+
+                def iter_content(self, chunk_size: int):
+                    for start in range(0, len(self.content), chunk_size):
+                        yield self.content[start : start + chunk_size]
+
+                def raise_for_status(self) -> None:
+                    return None
+
+            return _InlineResponse(data)  # type: ignore[return-value]
 
 
 def _read_simple_yaml(path: str | Path) -> Dict[str, Dict[str, Any]]:
