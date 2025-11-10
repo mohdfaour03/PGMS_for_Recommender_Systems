@@ -16,6 +16,7 @@ from typing import Any, Dict
 
 import pandas as pd
 import requests
+from requests import exceptions as requests_exceptions
 
 
 MOVIELENS_SMALL_URL = "https://files.grouplens.org/datasets/movielens/ml-latest-small.zip"
@@ -80,6 +81,21 @@ def _year_to_timestamp(year: int | None) -> int | None:
     return int(dt.timestamp())
 
 
+def _http_get(url: str, *, timeout: int, stream: bool = False) -> requests.Response:
+    try:
+        response = requests.get(url, timeout=timeout, stream=stream)
+        response.raise_for_status()
+        return response
+    except requests_exceptions.SSLError:
+        print(
+            f"[notebook_utils] SSL verification failed for {url}; retrying without verification."
+        )
+        requests.packages.urllib3.disable_warnings()  # type: ignore[attr-defined]
+        response = requests.get(url, timeout=timeout, stream=stream, verify=False)
+        response.raise_for_status()
+        return response
+
+
 def _read_simple_yaml(path: str | Path) -> Dict[str, Dict[str, Any]]:
     """Parse the minimal YAML subset used by the project configs."""
     content = Path(path).read_text(encoding="utf-8").splitlines()
@@ -119,8 +135,7 @@ def build_interaction_frame(dataset: str = "medium", limit: int | None = None) -
     url = MOVIELENS_SMALL_URL if dataset == "small" else MOVIELENS_MEDIUM_URL
     archive_prefix = "ml-latest-small" if dataset == "small" else "ml-latest"
 
-    response = requests.get(url, timeout=120 if dataset == "medium" else 60)
-    response.raise_for_status()
+    response = _http_get(url, timeout=120 if dataset == "medium" else 60)
     with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
         with archive.open(f"{archive_prefix}/ratings.csv") as fh:
             ratings = pd.read_csv(fh)
@@ -211,8 +226,7 @@ def build_amazon_interaction_frame(
     cache_dir.mkdir(parents=True, exist_ok=True)
     archive_path = cache_dir / f"amazon_{dataset}.json.gz"
     if not archive_path.exists():
-        response = requests.get(url, timeout=300)
-        response.raise_for_status()
+        response = _http_get(url, timeout=300, stream=True)
         with archive_path.open("wb") as fh:
             for chunk in response.iter_content(1 << 20):
                 fh.write(chunk)
