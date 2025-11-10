@@ -24,18 +24,23 @@ from urllib.parse import quote
 
 MOVIELENS_SMALL_URL = "https://files.grouplens.org/datasets/movielens/ml-latest-small.zip"
 MOVIELENS_MEDIUM_URL = "https://files.grouplens.org/datasets/movielens/ml-latest.zip"
-_AMAZON_BASE = "https://datarepo.eng.ucsd.edu/mcauley_group/data/amazon_v2/categoryFilesSmall"
-_AMAZON_FILE_MAP = {
-    "beauty": "All_Beauty.json.gz",
-    "baby": "Baby.json.gz",
-    "sports": "Sports_and_Outdoors.json.gz",
-    "electronics": "Electronics.json.gz",
-    "home": "Home_and_Kitchen.json.gz",
-    "digital_music": "Digital_Music.json.gz",
+_AMAZON_BASE_NAMES = {
+    "beauty": "All_Beauty",
+    "baby": "Baby",
+    "sports": "Sports_and_Outdoors",
+    "electronics": "Electronics",
+    "home": "Home_and_Kitchen",
+    "digital_music": "Digital_Music",
 }
-AMAZON_DATASETS = {
-    key: f"{_AMAZON_BASE}/{quote(filename)}" for key, filename in _AMAZON_FILE_MAP.items()
-}
+AMAZON_DATASETS = sorted(_AMAZON_BASE_NAMES.keys())
+_AMAZON_REVIEW_MIRRORS = [
+    "https://datarepo.eng.ucsd.edu/mcauley_group/data/amazon_v2/categoryFilesSmall",
+    "https://jmcauley.ucsd.edu/data/amazon_v2/categoryFilesSmall",
+]
+_AMAZON_META_MIRRORS = [
+    "https://datarepo.eng.ucsd.edu/mcauley_group/data/amazon_v2/metaFiles2",
+    "https://jmcauley.ucsd.edu/data/amazon_v2/metaFiles2",
+]
 _YEAR_SUFFIX = re.compile(r"\s*\((\d{4})\)\s*$")
 _MULTISPACE = re.compile(r"\s+")
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
@@ -121,6 +126,30 @@ def _http_get(url: str, *, timeout: int, stream: bool = False) -> requests.Respo
                     return None
 
             return _InlineResponse(data)  # type: ignore[return-value]
+
+
+def _download_file_with_mirrors(target: Path, urls: list[str], *, required: bool = True) -> Path | None:
+    if target.exists():
+        return target
+    last_error: Exception | None = None
+    for url in urls:
+        try:
+            response = _http_get(url, timeout=300, stream=True)
+            with target.open("wb") as fh:
+                for chunk in response.iter_content(1 << 20):
+                    if chunk:
+                        fh.write(chunk)
+            return target
+        except Exception as err:  # pragma: no cover - best effort network code
+            last_error = err
+            if target.exists():
+                try:
+                    target.unlink()
+                except Exception:
+                    pass
+    if required:
+        raise RuntimeError(f"Failed to download {target.name}: {last_error}")
+    return None
 
 
 def _read_simple_yaml(path: str | Path) -> Dict[str, Dict[str, Any]]:
@@ -246,18 +275,22 @@ def build_amazon_interaction_frame(
 ) -> pd.DataFrame:
     """Download an Amazon reviews subset and emit the schema-compatible frame."""
     dataset = (dataset or "beauty").lower()
-    url = AMAZON_DATASETS.get(dataset)
-    if url is None:
-        raise ValueError(f"Unknown amazon dataset '{dataset}'. Available: {sorted(AMAZON_DATASETS)}")
+    base_name = _AMAZON_BASE_NAMES.get(dataset)
+    if base_name is None:
+        raise ValueError(f"Unknown amazon dataset '{dataset}'. Available: {AMAZON_DATASETS}")
     cache_dir = Path(cache_dir or Path(__file__).resolve().parents[2] / "data")
     cache_dir.mkdir(parents=True, exist_ok=True)
-    archive_path = cache_dir / f"amazon_{dataset}.json.gz"
-    if not archive_path.exists():
-        response = _http_get(url, timeout=300, stream=True)
-        with archive_path.open("wb") as fh:
-            for chunk in response.iter_content(1 << 20):
-                fh.write(chunk)
-    frame = pd.read_json(archive_path, compression="gzip", lines=True)
+    reviews_path = cache_dir / f"{base_name}_5.json.gz"
+    meta_path = cache_dir / f"meta_{base_name}.json.gz"
+    review_urls = [
+        f"{mirror}/{quote(base_name)}_5.json.gz" for mirror in _AMAZON_REVIEW_MIRRORS
+    ]
+    meta_urls = [
+        f"{mirror}/meta_{quote(base_name)}.json.gz" for mirror in _AMAZON_META_MIRRORS
+    ]
+    _download_file_with_mirrors(reviews_path, review_urls, required=True)
+    _download_file_with_mirrors(meta_path, meta_urls, required=False)
+    frame = pd.read_json(reviews_path, compression="gzip", lines=True)
     expected = {"reviewerID", "asin", "overall", "unixReviewTime"}
     missing = expected - set(frame.columns)
     if missing:
