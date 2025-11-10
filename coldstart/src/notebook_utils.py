@@ -20,6 +20,15 @@ import requests
 
 MOVIELENS_SMALL_URL = "https://files.grouplens.org/datasets/movielens/ml-latest-small.zip"
 MOVIELENS_MEDIUM_URL = "https://files.grouplens.org/datasets/movielens/ml-latest.zip"
+AMAZON_DATASETS = {
+    # Lightweight category files released by UCSD (review subsets).
+    "beauty": "https://jmcauley.ucsd.edu/data/amazon_v2/categoryFilesSmall/Beauty.json.gz",
+    "baby": "https://jmcauley.ucsd.edu/data/amazon_v2/categoryFilesSmall/Baby.json.gz",
+    "sports": "https://jmcauley.ucsd.edu/data/amazon_v2/categoryFilesSmall/Sports_and_Outdoors.json.gz",
+    "electronics": "https://jmcauley.ucsd.edu/data/amazon_v2/categoryFilesSmall/Electronics.json.gz",
+    "home": "https://jmcauley.ucsd.edu/data/amazon_v2/categoryFilesSmall/Home_and_Kitchen.json.gz",
+    "digital_music": "https://jmcauley.ucsd.edu/data/amazon_v2/categoryFilesSmall/Digital_Music.json.gz",
+}
 _YEAR_SUFFIX = re.compile(r"\s*\((\d{4})\)\s*$")
 _MULTISPACE = re.compile(r"\s+")
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
@@ -188,9 +197,72 @@ def build_interaction_frame(dataset: str = "medium", limit: int | None = None) -
     ]
 
 
+def build_amazon_interaction_frame(
+    dataset: str = "beauty",
+    cache_dir: str | Path | None = None,
+    limit: int | None = None,
+) -> pd.DataFrame:
+    """Download an Amazon reviews subset and emit the schema-compatible frame."""
+    dataset = (dataset or "beauty").lower()
+    url = AMAZON_DATASETS.get(dataset)
+    if url is None:
+        raise ValueError(f"Unknown amazon dataset '{dataset}'. Available: {sorted(AMAZON_DATASETS)}")
+    cache_dir = Path(cache_dir or Path(__file__).resolve().parents[2] / "data")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = cache_dir / f"amazon_{dataset}.json.gz"
+    if not archive_path.exists():
+        response = requests.get(url, timeout=300)
+        response.raise_for_status()
+        with archive_path.open("wb") as fh:
+            for chunk in response.iter_content(1 << 20):
+                fh.write(chunk)
+    frame = pd.read_json(archive_path, compression="gzip", lines=True)
+    expected = {"reviewerID", "asin", "overall", "unixReviewTime"}
+    missing = expected - set(frame.columns)
+    if missing:
+        raise RuntimeError(f"Amazon file {archive_path} missing required columns: {missing}")
+    frame["reviewText"] = frame.get("reviewText", "").fillna("")
+    frame["summary"] = frame.get("summary", "").fillna("")
+    frame["category"] = frame.get("category", "").apply(
+        lambda value: " ".join(value) if isinstance(value, (list, tuple)) else str(value or "")
+    )
+    item_text = (
+        frame["summary"].astype(str).str.strip()
+        + " "
+        + frame["reviewText"].astype(str).str.strip()
+    ).str.strip()
+    item_text = item_text.str.lower().str.replace(r"\s+", " ", regex=True)
+    frame["item_text"] = item_text
+    frame["item_genres"] = frame["category"].fillna("").astype(str).str.lower().str.replace(
+        r"\s+", " ", regex=True
+    )
+    frame["item_tags"] = ""
+    frame["text_len"] = frame["item_text"].str.split().apply(len).astype(int)
+    frame["timestamp"] = frame["unixReviewTime"].astype(int)
+    output = pd.DataFrame(
+        {
+            "user_id": frame["reviewerID"].astype(str),
+            "item_id": frame["asin"].astype(str),
+            "rating_or_y": frame["overall"].astype(float),
+            "timestamp": frame["timestamp"],
+            "item_text": frame["item_text"].fillna(""),
+            "item_genres": frame["item_genres"],
+            "item_tags": frame["item_tags"],
+            "release_year": -1,
+            "release_ts": -1,
+            "text_len": frame["text_len"],
+        }
+    )
+    if limit is not None and limit > 0:
+        output = output.head(limit)
+    return output
+
+
 __all__ = [
     "_read_simple_yaml",
     "build_interaction_frame",
+    "build_amazon_interaction_frame",
     "MOVIELENS_SMALL_URL",
     "MOVIELENS_MEDIUM_URL",
+    "AMAZON_DATASETS",
 ]

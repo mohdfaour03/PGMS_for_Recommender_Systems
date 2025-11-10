@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import random
 from collections import Counter, defaultdict
 from typing import Dict, List, Sequence, Tuple
 
@@ -158,6 +159,7 @@ class FrozenBertLinearFeaturizer:
         proj_dim: int | None = 256,
         device: str | None = None,
         log_batch_stats_every: int = 0,
+        bucket_dropout: Dict[str, float] | None = None,
     ) -> None:
         if torch is None or AutoModel is None or AutoTokenizer is None:  # pragma: no cover - dynamic import
             raise ImportError("transformers and torch are required for frozen_bert_linear.")
@@ -184,6 +186,12 @@ class FrozenBertLinearFeaturizer:
         self._last_token_lengths: List[float] = []
         self._last_token_buckets: List[str] = []
         self._log_batch_stats_every = max(0, int(log_batch_stats_every))
+        self._bucket_dropout = {
+            (key or "").lower(): max(0.0, float(value))
+            for key, value in (bucket_dropout or {"medium": 0.1}).items()
+            if value and float(value) > 0
+        }
+        self._token_dropout_rng = random.Random(1234)
 
     def _log_batch_stats(
         self,
@@ -208,6 +216,22 @@ class FrozenBertLinearFeaturizer:
                 f"max_seq_len={self.max_length}"
             )
 
+    def _maybe_dropout_tokens(self, text: str, bucket_id: str | None) -> str:
+        bucket_key = (bucket_id or "").lower()
+        prob = self._bucket_dropout.get(bucket_key, 0.0)
+        if prob <= 0.0:
+            return text
+        tokens = text.split()
+        if not tokens:
+            return text
+        kept: List[str] = []
+        for token in tokens:
+            if self._token_dropout_rng.random() > prob:
+                kept.append(token)
+        if not kept:
+            kept = tokens[:1]
+        return " ".join(kept)
+
     def _embed(
         self,
         item_texts: Sequence[str],
@@ -221,10 +245,15 @@ class FrozenBertLinearFeaturizer:
         for start in range(0, len(item_texts), self.batch_size):
             batch = [text or "" for text in item_texts[start : start + self.batch_size]]
             batch_bucket = (
-                all_buckets[start : start + self.batch_size] if all_buckets is not None else None
+                all_buckets[start : start + self.batch_size]
+                if all_buckets is not None
+                else [None] * len(batch)
             )
+            processed_batch = [
+                self._maybe_dropout_tokens(text, bucket_id) for text, bucket_id in zip(batch, batch_bucket)
+            ]
             encoded = self._tokenizer(
-                batch,
+                processed_batch,
                 padding="max_length",
                 truncation="longest_first",
                 max_length=self.max_length,
@@ -234,7 +263,7 @@ class FrozenBertLinearFeaturizer:
             token_lengths = encoded["attention_mask"].sum(dim=1)
             self._last_token_lengths.extend(token_lengths.tolist())
             if batch_bucket is not None:
-                self._last_token_buckets.extend(batch_bucket)
+                self._last_token_buckets.extend([(bucket or "unknown") for bucket in batch_bucket])
             with torch.no_grad():
                 result = self._model(**encoded)
                 hidden = result.last_hidden_state

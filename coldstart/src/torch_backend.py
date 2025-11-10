@@ -303,7 +303,7 @@ class CMCLHardNegativesConfig:
 class CMCLConfig:
     lr: float = 5e-4
     reg: float = 1e-4
-    iters: int = 60
+    iters: int = 120
     batch_size: int = 128
     temperature: float = 0.05
     self_normalize: bool = True
@@ -320,10 +320,13 @@ class CMCLConfig:
     grad_alert_patience: int = 5
     log_interval: int = 10
     text_log_batches: int = 5
-    sampled_negatives: int = 256
+    sampled_negatives: int = 512
     neg_sampler_seed: int = 17
     margin_m: float = 0.1
-    margin_alpha: float = 0.05
+    margin_alpha: float = 0.1
+    user_dropout: float = 0.2
+    warmup_iters: int = 5
+    use_cosine_schedule: bool = True
     hard_negatives: CMCLHardNegativesConfig = field(default_factory=CMCLHardNegativesConfig)
 
 
@@ -650,7 +653,14 @@ def infer_micm(
 
 
 class CMCLModel(nn.Module):
-    def __init__(self, n_features: int, n_factors: int, hidden_dim: int = 512, dropout: float = 0.1) -> None:
+    def __init__(
+        self,
+        n_features: int,
+        n_factors: int,
+        hidden_dim: int = 512,
+        dropout: float = 0.1,
+        user_dropout: float = 0.2,
+    ) -> None:
         super().__init__()
         hidden_dim = max(hidden_dim, n_factors)
         self.item_encoder = nn.Sequential(
@@ -662,6 +672,7 @@ class CMCLModel(nn.Module):
         )
         self.user_adapter = nn.Sequential(
             nn.LayerNorm(n_factors),
+            nn.Dropout(max(0.0, user_dropout)),
             nn.Linear(n_factors, n_factors),
         )
 
@@ -1025,6 +1036,7 @@ def train_cmcl(
         len(user_factors[0]),
         hidden_dim=config.proj_hidden_dim,
         dropout=config.dropout,
+        user_dropout=config.user_dropout,
     ).to(device)
     encoder_lr = config.encoder_lr or config.lr
     head_lr = config.head_lr or max(config.lr * 2.0, config.lr)
@@ -1038,6 +1050,20 @@ def train_cmcl(
     )
     stagnant_counts: Dict[str, int] = {}
     bucket_map = text_bucket_lookup or {}
+    base_lrs = [group["lr"] for group in optimizer.param_groups]
+    total_epochs = max(config.iters, 1)
+    warmup_iters = max(0, config.warmup_iters)
+
+    def _lr_scale(epoch_idx: int) -> float:
+        if not config.use_cosine_schedule:
+            return 1.0
+        if warmup_iters > 0 and epoch_idx < warmup_iters:
+            return (epoch_idx + 1) / warmup_iters
+        if total_epochs <= warmup_iters:
+            return 1.0
+        progress = (epoch_idx + 1 - warmup_iters) / max(total_epochs - warmup_iters, 1)
+        progress = min(max(progress, 0.0), 1.0)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     def _log_batch_text_lengths(batch_index: int, batch_items: Sequence[str]) -> None:
         if not text_len_lookup:
@@ -1057,6 +1083,9 @@ def train_cmcl(
             )
 
     for epoch in range(config.iters):
+        lr_multiplier = _lr_scale(epoch)
+        for group, base in zip(optimizer.param_groups, base_lrs):
+            group["lr"] = base * lr_multiplier
         epoch_loss = 0.0
         batches = 0
         grad_history: Dict[str, List[float]] = {}
@@ -1139,7 +1168,8 @@ def train_cmcl(
             print(
                 f"[cmcl] epoch {epoch + 1}/{config.iters}: "
                 f"loss={epoch_loss / batches:.4f} "
-                f"grad_norms={epoch_grad_summary}"
+                f"grad_norms={epoch_grad_summary} "
+                f"lr_scale={lr_multiplier:.4f}"
             )
     return model.cpu()
 
