@@ -24,14 +24,15 @@ import urllib.request
 MOVIELENS_SMALL_URL = "https://files.grouplens.org/datasets/movielens/ml-latest-small.zip"
 MOVIELENS_MEDIUM_URL = "https://files.grouplens.org/datasets/movielens/ml-latest.zip"
 _AMAZON_BASE = "https://datarepo.eng.ucsd.edu/mcauley_group/data/amazon_v2/categoryFilesSmall"
-AMAZON_DATASETS = {
-    "beauty": f"{_AMAZON_BASE}/Beauty.json.gz",
-    "baby": f"{_AMAZON_BASE}/Baby.json.gz",
-    "sports": f"{_AMAZON_BASE}/Sports_and_Outdoors.json.gz",
-    "electronics": f"{_AMAZON_BASE}/Electronics.json.gz",
-    "home": f"{_AMAZON_BASE}/Home_and_Kitchen.json.gz",
-    "digital_music": f"{_AMAZON_BASE}/Digital_Music.json.gz",
+_AMAZON_FILE_MAP = {
+    "beauty": "All_Beauty.json.gz",
+    "baby": "Baby.json.gz",
+    "sports": "Sports_and_Outdoors.json.gz",
+    "electronics": "Electronics.json.gz",
+    "home": "Home_and_Kitchen.json.gz",
+    "digital_music": "Digital_Music.json.gz",
 }
+AMAZON_DATASETS = {key: f"{_AMAZON_BASE}/{filename}" for key, filename in _AMAZON_FILE_MAP.items()}
 _YEAR_SUFFIX = re.compile(r"\s*\((\d{4})\)\s*$")
 _MULTISPACE = re.compile(r"\s+")
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
