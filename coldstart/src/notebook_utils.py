@@ -295,9 +295,14 @@ def build_amazon_interaction_frame(
     missing = expected - set(frame.columns)
     if missing:
         raise RuntimeError(f"Amazon file {archive_path} missing required columns: {missing}")
-    frame["reviewText"] = frame.get("reviewText", "").fillna("")
-    frame["summary"] = frame.get("summary", "").fillna("")
-    frame["category"] = frame.get("category", "").apply(
+    n_rows = len(frame)
+    review_default = pd.Series([""] * n_rows)
+    frame["reviewText"] = frame.get("reviewText", review_default).fillna("")
+    frame["summary"] = frame.get("summary", review_default).fillna("")
+    category_series = frame.get("category")
+    if category_series is None:
+        category_series = pd.Series([""] * n_rows)
+    frame["category"] = category_series.apply(
         lambda value: " ".join(value) if isinstance(value, (list, tuple)) else str(value or "")
     )
     item_text = (
