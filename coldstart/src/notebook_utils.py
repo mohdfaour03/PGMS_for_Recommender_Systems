@@ -19,6 +19,7 @@ import requests
 from requests import exceptions as requests_exceptions
 import ssl
 import urllib.request
+from urllib.parse import quote
 
 
 MOVIELENS_SMALL_URL = "https://files.grouplens.org/datasets/movielens/ml-latest-small.zip"
@@ -32,7 +33,9 @@ _AMAZON_FILE_MAP = {
     "home": "Home_and_Kitchen.json.gz",
     "digital_music": "Digital_Music.json.gz",
 }
-AMAZON_DATASETS = {key: f"{_AMAZON_BASE}/{filename}" for key, filename in _AMAZON_FILE_MAP.items()}
+AMAZON_DATASETS = {
+    key: f"{_AMAZON_BASE}/{quote(filename)}" for key, filename in _AMAZON_FILE_MAP.items()
+}
 _YEAR_SUFFIX = re.compile(r"\s*\((\d{4})\)\s*$")
 _MULTISPACE = re.compile(r"\s+")
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
