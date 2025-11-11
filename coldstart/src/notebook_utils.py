@@ -10,6 +10,7 @@ import ast
 import io
 import zipfile
 from datetime import datetime, timezone
+import html
 import re
 from pathlib import Path
 from typing import Any, Dict
@@ -41,9 +42,23 @@ _AMAZON_META_MIRRORS = [
     "https://datarepo.eng.ucsd.edu/mcauley_group/data/amazon_v2/metaFiles2",
     "https://jmcauley.ucsd.edu/data/amazon_v2/metaFiles2",
 ]
+GOODREADS_BASE_URL = "https://mcauleylab.ucsd.edu/public_datasets/gdrive/goodreads"
+_GOODREADS_GENRE_SLUGS = {
+    "children": "children",
+    "comics_graphic": "comics_graphic",
+    "fantasy_paranormal": "fantasy_paranormal",
+    "history_biography": "history_biography",
+    "mystery_thriller_crime": "mystery_thriller_crime",
+    "poetry": "poetry",
+    "romance": "romance",
+    "young_adult": "young_adult",
+}
+GOODREADS_GENRES = sorted(_GOODREADS_GENRE_SLUGS.keys())
 _YEAR_SUFFIX = re.compile(r"\s*\((\d{4})\)\s*$")
 _MULTISPACE = re.compile(r"\s+")
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
+_HTML_TAG = re.compile(r"<[^>]+>")
+_GOODREADS_TS_FORMAT = "%a %b %d %H:%M:%S %z %Y"
 
 
 def _strip_year_suffix(title: str) -> tuple[str, int | None]:
@@ -83,6 +98,103 @@ def _aggregate_tags(tags: pd.DataFrame) -> Dict[int, str]:
 
     grouped = tags.groupby("movieId")["tag"].agg(_join)
     return grouped.to_dict()
+
+
+def _normalize_free_text(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    cleaned = html.unescape(text)
+    cleaned = _HTML_TAG.sub(" ", cleaned)
+    cleaned = cleaned.replace("&nbsp;", " ")
+    return _MULTISPACE.sub(" ", cleaned.lower()).strip()
+
+
+def _coerce_year(value: Any) -> int:
+    if value in ("", None):
+        return -1
+    try:
+        year = int(float(value))
+    except (TypeError, ValueError):
+        return -1
+    return year if 0 < year < 3000 else -1
+
+
+def _goodreads_series_timestamp(frame: pd.DataFrame, columns: list[str]) -> pd.Series:
+    timestamp = pd.Series(-1, index=frame.index, dtype="int64")
+    for column in columns:
+        if column not in frame.columns:
+            continue
+        parsed = pd.to_datetime(
+            frame[column],
+            utc=True,
+            errors="coerce",
+            format=_GOODREADS_TS_FORMAT,
+        )
+        mask = parsed.notna()
+        if not mask.any():
+            continue
+        numeric = pd.Series(-1, index=frame.index, dtype="int64")
+        numeric.loc[mask] = (parsed[mask].astype("int64") // 10**9).astype("int64")
+        timestamp = timestamp.where(timestamp >= 0, numeric)
+    return timestamp.where(timestamp >= 0, 0).astype(int)
+
+
+def _extract_goodreads_shelves(raw: Any, *, limit: int = 32) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    cleaned = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not name:
+            continue
+        token = _normalize_token_block(str(name))
+        if not token:
+            continue
+        token = token.replace(" ", "_")
+        try:
+            count = int(entry.get("count", 0))
+        except (TypeError, ValueError):
+            count = 0
+        cleaned.append((count, token))
+    cleaned.sort(key=lambda pair: pair[0], reverse=True)
+    return [token for _, token in cleaned[:limit]]
+
+
+def _flatten_series_list(values: Any) -> str:
+    if isinstance(values, list):
+        tokens = [_normalize_token_block(str(value)) for value in values if value]
+        return " ".join(token for token in tokens if token)
+    if isinstance(values, str):
+        return _normalize_token_block(values)
+    return ""
+
+
+def _author_tokens(entries: Any, author_map: Dict[str, str]) -> str:
+    if not isinstance(entries, list):
+        return ""
+    names: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        author_id = entry.get("author_id")
+        if not author_id:
+            continue
+        name = author_map.get(str(author_id))
+        if name:
+            names.append(name)
+    if not names:
+        return ""
+    return _MULTISPACE.sub(" ", " ".join(names)).strip()
+
+
+def _series_or_default(frame: pd.DataFrame, column: str, default: Any) -> pd.Series:
+    if column in frame.columns:
+        return frame[column]
+    if callable(default):
+        return pd.Series([default() for _ in range(len(frame))], index=frame.index)
+    return pd.Series([default] * len(frame), index=frame.index)
 
 
 def _year_to_timestamp(year: int | None) -> int | None:
@@ -337,11 +449,183 @@ def build_amazon_interaction_frame(
     return output
 
 
+def build_goodreads_interaction_frame(
+    genre: str = "poetry",
+    cache_dir: str | Path | None = None,
+    limit: int | None = None,
+) -> pd.DataFrame:
+    """Download a Goodreads genre subset and emit the schema-compatible frame."""
+    genre = (genre or "poetry").lower()
+    slug = _GOODREADS_GENRE_SLUGS.get(genre)
+    if slug is None:
+        raise ValueError(
+            f"Unknown goodreads genre '{genre}'. Available: {GOODREADS_GENRES}"
+        )
+    cache_dir = Path(cache_dir or Path(__file__).resolve().parents[2] / "data")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    interactions_name = f"goodreads_interactions_{slug}.json.gz"
+    books_name = f"goodreads_books_{slug}.json.gz"
+    authors_name = "goodreads_book_authors.json.gz"
+    interactions_path = cache_dir / interactions_name
+    books_path = cache_dir / books_name
+    authors_path = cache_dir / authors_name
+    _download_file_with_mirrors(
+        interactions_path,
+        [f"{GOODREADS_BASE_URL}/byGenre/{interactions_name}"],
+        required=True,
+    )
+    _download_file_with_mirrors(
+        books_path,
+        [f"{GOODREADS_BASE_URL}/byGenre/{books_name}"],
+        required=True,
+    )
+    _download_file_with_mirrors(
+        authors_path,
+        [f"{GOODREADS_BASE_URL}/{authors_name}"],
+        required=False,
+    )
+    read_kwargs = {"compression": "gzip", "lines": True}
+    if limit is not None and limit > 0:
+        read_kwargs["nrows"] = int(limit)
+    interactions = pd.read_json(interactions_path, **read_kwargs)
+    if limit is not None and limit > 0:
+        interactions = interactions.head(limit)
+    if interactions.empty:
+        raise RuntimeError("No interactions found in the Goodreads file.")
+    interactions["user_id"] = interactions["user_id"].astype(str)
+    interactions["book_id"] = interactions["book_id"].astype(str)
+    timestamp_cols = ["date_updated", "read_at", "date_added", "started_at"]
+    interactions["timestamp"] = _goodreads_series_timestamp(interactions, timestamp_cols)
+    rating_col = interactions.get("rating")
+    if rating_col is None:
+        interactions["rating"] = 0.0
+    interactions["rating"] = interactions["rating"].fillna(0).astype(float)
+    books = pd.read_json(books_path, compression="gzip", lines=True)
+    books["book_id"] = books["book_id"].astype(str)
+    book_ids = interactions["book_id"].unique().tolist()
+    books = books[books["book_id"].isin(book_ids)].copy()
+    title_series = _series_or_default(books, "title_without_series", "")
+    title_fallback = _series_or_default(books, "title", "")
+    books["title_norm"] = (
+        title_series.fillna(title_fallback).fillna("").apply(_normalize_free_text)
+    )
+    books["description_norm"] = _series_or_default(books, "description", "").apply(
+        _normalize_free_text
+    )
+    books["publisher_norm"] = _series_or_default(books, "publisher", "").apply(
+        _normalize_token_block
+    )
+    books["format_norm"] = _series_or_default(books, "format", "").apply(
+        _normalize_token_block
+    )
+    books["series_norm"] = _series_or_default(books, "series", list).apply(
+        _flatten_series_list
+    )
+    books["shelf_tokens"] = _series_or_default(books, "popular_shelves", list).apply(
+        _extract_goodreads_shelves
+    )
+    author_map: Dict[str, str] = {}
+    if authors_path.exists():
+        author_ids: set[str] = set()
+        for entries in _series_or_default(books, "authors", list):
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                author_id = entry.get("author_id")
+                if author_id:
+                    author_ids.add(str(author_id))
+        if author_ids:
+            authors_df = pd.read_json(authors_path, compression="gzip", lines=True)
+            authors_df["author_id"] = authors_df["author_id"].astype(str)
+            authors_df["name"] = authors_df["name"].astype(str).str.lower()
+            filtered = authors_df[authors_df["author_id"].isin(author_ids)]
+            author_map = filtered.set_index("author_id")["name"].to_dict()
+    books["author_text"] = _series_or_default(books, "authors", list).apply(
+        lambda value: _author_tokens(value, author_map)
+    )
+    books["shelf_phrase"] = books["shelf_tokens"].apply(lambda tokens: " ".join(tokens))
+    books["item_genres"] = books["shelf_tokens"].apply(
+        lambda tokens: " ".join(tokens[:12])
+    )
+    books["item_tags"] = books["shelf_tokens"].apply(
+        lambda tokens: " ".join(tokens[12:32])
+    )
+    text_columns = [
+        "title_norm",
+        "author_text",
+        "description_norm",
+        "series_norm",
+        "publisher_norm",
+        "format_norm",
+        "shelf_phrase",
+    ]
+    books["item_text"] = (
+        books[text_columns]
+        .fillna("")
+        .agg(" ".join, axis=1)
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+    )
+    books["item_text"] = books["item_text"].fillna("")
+    books["text_len"] = books["item_text"].str.split().apply(len).astype(int)
+    publication_years = _series_or_default(books, "publication_year", -1)
+    books["release_year"] = publication_years.apply(_coerce_year)
+    books["release_ts"] = books["release_year"].apply(
+        lambda year: _year_to_timestamp(year if year > 0 else None) or -1
+    )
+    books["release_ts"] = books["release_ts"].astype(int)
+    frame = interactions.merge(
+        books[
+            [
+                "book_id",
+                "item_text",
+                "item_genres",
+                "item_tags",
+                "release_year",
+                "release_ts",
+                "text_len",
+            ]
+        ],
+        on="book_id",
+        how="left",
+    )
+    frame = frame.rename(
+        columns={
+            "book_id": "item_id",
+            "rating": "rating_or_y",
+        }
+    )
+    frame["item_text"] = frame["item_text"].fillna("")
+    frame["item_genres"] = frame["item_genres"].fillna("")
+    frame["item_tags"] = frame["item_tags"].fillna("")
+    frame["release_year"] = frame["release_year"].fillna(-1).astype(int)
+    frame["release_ts"] = frame["release_ts"].fillna(-1).astype(int)
+    frame["text_len"] = frame["text_len"].fillna(0).astype(int)
+    frame["timestamp"] = frame["timestamp"].astype(int)
+    frame["rating_or_y"] = frame["rating_or_y"].astype(float)
+    return frame[
+        [
+            "user_id",
+            "item_id",
+            "rating_or_y",
+            "timestamp",
+            "item_text",
+            "item_genres",
+            "item_tags",
+            "release_year",
+            "release_ts",
+            "text_len",
+        ]
+    ]
+
+
 __all__ = [
     "_read_simple_yaml",
     "build_interaction_frame",
     "build_amazon_interaction_frame",
+    "build_goodreads_interaction_frame",
     "MOVIELENS_SMALL_URL",
     "MOVIELENS_MEDIUM_URL",
     "AMAZON_DATASETS",
+    "GOODREADS_GENRES",
 ]

@@ -25,7 +25,7 @@ For a practical benchmark you can fetch MovieLens latest-small or latest (~1 M i
 
 1. **Open the notebook**
 
-   Launch `coldstart/notebooks/coldstart_workflow.ipynb`. The first cell ensures the MovieLens latest (medium) dataset is present.
+   Launch `coldstart/notebooks/coldstart_workflow.ipynb`. The first cell now supports `DATA_SOURCE = "movielens"`, `"amazon"`, or `"goodreads"` and ensures the matching dataset is materialised. Choose one of the built-in `GOODREADS_VARIANT` options (`children`, `comics_graphic`, `fantasy_paranormal`, `history_biography`, `mystery_thriller_crime`, `poetry`, `romance`, or `young_adult`) to pull a genre-specific Goodreads split that already includes cleaned text, shelf tags, and author metadata.
 
 2. **Prepare the data**
 
