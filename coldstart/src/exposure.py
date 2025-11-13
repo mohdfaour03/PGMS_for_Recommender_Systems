@@ -8,7 +8,7 @@ import random
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -34,26 +34,6 @@ class ExposureConfig:
 
 
 MAX_EXPOSURE_TRAIN_EXAMPLES = 100_000
-
-
-def _safe_timestamp(value: Any) -> int:
-    if value in {None, ""}:
-        return 0
-    try:
-        if isinstance(value, float):
-            if math.isnan(value):
-                return 0
-            numeric = value
-        elif isinstance(value, str):
-            text = value.strip()
-            if not text or text.lower() == "nan":
-                return 0
-            numeric = float(text)
-        else:
-            numeric = float(value)
-        return max(int(numeric), 0)
-    except (ValueError, TypeError):
-        return 0
 
 
 def _cap_training_examples(
@@ -102,7 +82,8 @@ def _collect_item_metadata(rows: Sequence[dict]) -> Tuple[Dict[str, dict], List[
         genre_tokens.update(genres)
         text_len = int(row.get("text_len") or 0)
         max_text_len = max(max_text_len, text_len)
-        release_ts = _safe_timestamp(row.get("release_ts"))
+        release_ts = row.get("release_ts")
+        release_ts = int(release_ts) if release_ts not in {None, ""} else 0
         meta[item] = {
             "release_ts": max(release_ts, 0),
             "text_len": text_len,
