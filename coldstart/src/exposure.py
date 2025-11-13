@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import bisect
-import gc
 import math
 import random
 from collections import Counter, defaultdict
@@ -31,27 +30,6 @@ class ExposureConfig:
     seed: int = 13
     max_training_samples: int | None = None
     prefer_gpu: bool = True
-
-
-MAX_EXPOSURE_TRAIN_EXAMPLES = 100_000
-
-
-def _cap_training_examples(
-    features: List[List[float]],
-    labels: List[float],
-    seed: int,
-) -> tuple[List[List[float]], List[float]]:
-    if len(features) <= MAX_EXPOSURE_TRAIN_EXAMPLES:
-        return features, labels
-    rng = random.Random(seed)
-    indices = sorted(rng.sample(range(len(features)), MAX_EXPOSURE_TRAIN_EXAMPLES))
-    capped_features = [features[idx] for idx in indices]
-    capped_labels = [labels[idx] for idx in indices]
-    print(
-        f"[Exposure] capped training pairs to {len(capped_features)} "
-        f"(max={MAX_EXPOSURE_TRAIN_EXAMPLES})."
-    )
-    return capped_features, capped_labels
 
 
 class _ExposureMLP(nn.Module):
@@ -251,7 +229,6 @@ def train_exposure_model(
 ) -> Dict[str, float]:
     builder = _ExposureBuilder(warm_rows, config)
     features, labels = builder.build_training_pairs()
-    features, labels = _cap_training_examples(features, labels, config.seed)
     if not features:
         raise RuntimeError("No exposure pairs could be generated.")
 
@@ -260,16 +237,11 @@ def train_exposure_model(
     targets = torch.tensor(labels, dtype=torch.float32).unsqueeze(1)
     del features, labels
     dataset = torch.utils.data.TensorDataset(inputs, targets)
-    requested_batch = max(32, config.batch_size)
-    effective_batch = min(256, requested_batch)
     loader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=effective_batch,
+        batch_size=max(32, config.batch_size),
         shuffle=True,
         drop_last=False,
-        num_workers=2,
-        persistent_workers=False,
-        pin_memory=False,
     )
 
     model = _ExposureMLP(builder.feature_dim, config.hidden_dim).to(device)
@@ -306,10 +278,6 @@ def train_exposure_model(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(checkpoint, out_path)
     print(f"Saved exposure checkpoint with {len(pi_lookup)} entries to {out_path}.")
-    del dataset, loader, inputs, targets, model, optimizer, criterion
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
     return pi_lookup
 
 
