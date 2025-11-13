@@ -1024,12 +1024,16 @@ def train_cmcl(
         negative_sampler,
         config.sampled_negatives,
     )
+    effective_batch = min(256, max(1, config.batch_size))
     loader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=max(1, config.batch_size),
+        batch_size=effective_batch,
         shuffle=True,
         drop_last=False,
         collate_fn=collate,
+        num_workers=2,
+        persistent_workers=False,
+        pin_memory=False,
     )
     model = CMCLModel(
         len(warm_features[0]),

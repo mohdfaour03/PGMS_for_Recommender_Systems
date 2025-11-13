@@ -1,9 +1,11 @@
 """End-to-end routines for the cold-start benchmark."""
 from __future__ import annotations
 
+import gc
 import math
+import random
 from pathlib import Path
-from typing import Any, Dict, Sequence
+from typing import Any, Dict, Sequence, List, Tuple
 
 from . import data_io
 from .evaluation import hit_ndcg_at_k
@@ -11,6 +13,80 @@ from .exposure import ExposureConfig, load_exposure_checkpoint, train_exposure_m
 from .models import a2f, cdl, ctr_lite, ctpf, hft, mf
 from .split_strict import persist_split, strict_cold_split
 from .text_featurizer import build_text_featurizer
+
+DEBUG_SMALL = True
+MAX_WARM_INTERACTIONS = 80_000
+MAX_COLD_INTERACTIONS = 30_000
+_DOWNSAMPLE_SEED = 42
+
+
+def _downsample_interactions(
+    rows: Sequence[dict],
+    limit: int | None,
+    label: str,
+) -> list[dict]:
+    if (
+        not DEBUG_SMALL
+        or not rows
+        or limit is None
+        or limit <= 0
+        or len(rows) <= limit
+    ):
+        return list(rows)
+    try:  # Prefer stable pandas sampling for reproducibility if available.
+        import pandas as pd  # type: ignore
+    except Exception:  # pragma: no cover - optional dependency
+        pd = None
+    count = min(limit, len(rows))
+    if pd is not None:
+        frame = pd.DataFrame(rows)
+        sampled = (
+            frame.sample(n=count, random_state=_DOWNSAMPLE_SEED)
+            .reset_index(drop=True)
+            .to_dict("records")
+        )
+    else:
+        rng = random.Random(_DOWNSAMPLE_SEED)
+        indices = sorted(rng.sample(range(len(rows)), count))
+        sampled = [rows[idx] for idx in indices]
+    print(f"[debug] downsampling {label} interactions from {len(rows)} to {len(sampled)}")
+    return sampled
+
+
+def _free_memory(reason: str | None = None) -> None:
+    if reason:
+        print(f"[memory] clearing caches before {reason}")
+    gc.collect()
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - torch optional for numpy backend
+        torch = None
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _filter_items_with_features(
+    item_ids: Sequence[str],
+    features: Sequence[Sequence[float]],
+    keep_items: set[str],
+    tag: str,
+) -> Tuple[list[str], list[list[float]]]:
+    if not keep_items:
+        print(f"[debug] {tag} keep-set empty; skipping downstream models.")
+        return [], []
+    filtered_ids: list[str] = []
+    filtered_features: list[list[float]] = []
+    for item_id, feature_row in zip(item_ids, features):
+        if item_id in keep_items:
+            filtered_ids.append(item_id)
+            filtered_features.append(list(feature_row) if not isinstance(feature_row, list) else feature_row)
+    dropped = len(item_ids) - len(filtered_ids)
+    if dropped > 0:
+        print(f"[debug] filtered out {dropped} {tag} items not present in sampled interactions.")
+    missing = len(keep_items - set(filtered_ids))
+    if missing > 0:
+        print(f"[warn] {missing} sampled {tag} items lacked precomputed features and were skipped.")
+    return filtered_ids, filtered_features
 
 
 def _unique_item_text(interactions: Sequence[dict]) -> Dict[str, str]:
@@ -351,10 +427,30 @@ def train_and_evaluate_content_model(
     data_path = Path(data_dir)
     warm_rows = data_io.load_interactions(data_path / "warm_interactions.csv")
     cold_rows = data_io.load_interactions(data_path / "cold_interactions.csv")
+    warm_rows = _downsample_interactions(warm_rows, MAX_WARM_INTERACTIONS, "warm")
+    cold_rows = _downsample_interactions(cold_rows, MAX_COLD_INTERACTIONS, "cold")
     warm_item_ids = data_io.load_json(data_path / "warm_item_ids.json")
     cold_item_ids = data_io.load_json(data_path / "cold_item_ids.json")
     warm_features = data_io.load_matrix(data_path / "warm_item_text_features.json")
     cold_features = data_io.load_matrix(data_path / "cold_item_text_features.json")
+    warm_items_in_rows = {row["item_id"] for row in warm_rows}
+    cold_items_in_rows = {row["item_id"] for row in cold_rows}
+    warm_item_ids, warm_features = _filter_items_with_features(
+        warm_item_ids,
+        warm_features,
+        warm_items_in_rows,
+        "warm",
+    )
+    cold_item_ids, cold_features = _filter_items_with_features(
+        cold_item_ids,
+        cold_features,
+        cold_items_in_rows,
+        "cold",
+    )
+    if not warm_item_ids:
+        raise RuntimeError("No warm items remain after downsampling; decrease MAX_WARM_INTERACTIONS or adjust the dataset.")
+    if not cold_item_ids:
+        raise RuntimeError("No cold items remain after downsampling; decrease MAX_COLD_INTERACTIONS or adjust the dataset.")
     warm_item_text = _unique_item_text(warm_rows)
     cold_item_text = _unique_item_text(cold_rows)
     text_len_lookup: Dict[str, int] = {}
@@ -804,6 +900,7 @@ def train_and_evaluate_content_model(
                 ),
             )
             item_exposure = torch_backend.aggregate_item_exposure(pi_lookup, cmcl_config.pi_floor)
+            _free_memory("[cmcl] training")
             cmcl_model = torch_backend.train_cmcl(
                 warm_rows,
                 warm_item_ids,
@@ -829,6 +926,8 @@ def train_and_evaluate_content_model(
                 prefer_gpu=prefer_gpu,
                 batch_size=score_batch_size,
             )
+            del cmcl_model
+            _free_memory("[cmcl] inference/adaptation cleanup")
             scores = _score(adapted_users, V_cold)
             pop_bias_cfg = cfg.get("pop_bias", {})
             if pop_bias_cfg.get("enable"):

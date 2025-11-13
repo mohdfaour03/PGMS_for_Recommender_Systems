@@ -165,7 +165,7 @@ class FrozenBertLinearFeaturizer:
             raise ImportError("transformers and torch are required for frozen_bert_linear.")
         self.model_name = model_name
         self.batch_size = max(1, batch_size)
-        self.max_length = max(8, max_length)
+        self.max_length = max(8, min(128, max_length))
         valid_pooling = {"cls", "mean", "cls_mean"}
         self.pooling = pooling if pooling in valid_pooling else "mean"
         self.proj_dim = proj_dim
@@ -255,7 +255,7 @@ class FrozenBertLinearFeaturizer:
             encoded = self._tokenizer(
                 processed_batch,
                 padding="max_length",
-                truncation="longest_first",
+                truncation=True,
                 max_length=self.max_length,
                 return_tensors="pt",
             )
