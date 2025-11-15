@@ -7,6 +7,7 @@ do not need to depend on the terminal entrypoints.
 from __future__ import annotations
 
 import ast
+import csv
 import io
 import zipfile
 from datetime import datetime, timezone
@@ -54,6 +55,20 @@ _GOODREADS_GENRE_SLUGS = {
     "young_adult": "young_adult",
 }
 GOODREADS_GENRES = sorted(_GOODREADS_GENRE_SLUGS.keys())
+_MSNEWS_VARIANTS = {
+    "mind_small_train": {
+        "url": "https://mind201910small.blob.core.windows.net/release/MINDsmall_train.zip",
+        "folder": "MINDsmall_train",
+        "zip_name": "MINDsmall_train.zip",
+    },
+    "mind_small_dev": {
+        "url": "https://mind201910small.blob.core.windows.net/release/MINDsmall_dev.zip",
+        "folder": "MINDsmall_dev",
+        "zip_name": "MINDsmall_dev.zip",
+    },
+}
+MSNEWS_VARIANTS = sorted(_MSNEWS_VARIANTS.keys())
+_MSNEWS_TIMESTAMP_FORMAT = "%m/%d/%Y %I:%M:%S %p"
 _YEAR_SUFFIX = re.compile(r"\s*\((\d{4})\)\s*$")
 _MULTISPACE = re.compile(r"\s+")
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
@@ -619,13 +634,165 @@ def build_goodreads_interaction_frame(
     ]
 
 
+def _ensure_msnews_resources(variant: str, cache_dir: Path) -> tuple[Path, Path]:
+    cache_dir = cache_dir.expanduser().resolve()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    info = _MSNEWS_VARIANTS[variant]
+    zip_path = cache_dir / info["zip_name"]
+    _download_file_with_mirrors(zip_path, [info["url"]])
+    extract_root = cache_dir / info["folder"]
+    news_path = extract_root / "news.tsv"
+    behaviors_path = extract_root / "behaviors.tsv"
+    if not news_path.exists() or not behaviors_path.exists():
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(cache_dir)
+    if not news_path.exists() or not behaviors_path.exists():
+        raise FileNotFoundError(
+            f"Missing Microsoft News files for {variant}; expected {news_path} and {behaviors_path}"
+        )
+    return news_path, behaviors_path
+
+
+def _extract_msnews_clicked(impressions: str) -> list[str]:
+    results: list[str] = []
+    if not isinstance(impressions, str):
+        return results
+    for token in impressions.split():
+        if "-" not in token:
+            continue
+        item_id, flag = token.rsplit("-", 1)
+        if flag == "1" and item_id:
+            results.append(item_id)
+    return results
+
+
+def build_msnews_interaction_frame(
+    variant: str = "mind_small_train",
+    cache_dir: Path | str | None = None,
+) -> pd.DataFrame:
+    cache_dir = Path(cache_dir or Path(__file__).resolve().parents[2] / "data")
+    normalized_variant = (variant or "mind_small_train").lower()
+    if normalized_variant not in _MSNEWS_VARIANTS:
+        raise ValueError(
+            f"Unknown Microsoft News variant '{variant}'. "
+            f"Available options: {', '.join(MSNEWS_VARIANTS)}"
+        )
+    news_path, behaviors_path = _ensure_msnews_resources(
+        normalized_variant, cache_dir
+    )
+    news_columns = [
+        "news_id",
+        "category",
+        "subcategory",
+        "title",
+        "abstract",
+        "url",
+        "title_entities",
+        "abstract_entities",
+    ]
+    news_df = pd.read_csv(
+        news_path,
+        sep="\t",
+        header=None,
+        names=news_columns,
+        quoting=csv.QUOTE_NONE,
+        on_bad_lines="skip",
+        encoding="utf-8",
+        engine="python",
+    )
+    news_df["news_id"] = news_df["news_id"].astype(str)
+    title_norm = news_df["title"].fillna("").apply(_normalize_free_text)
+    abstract_norm = news_df["abstract"].fillna("").apply(_normalize_free_text)
+    news_df["item_text"] = (title_norm + " " + abstract_norm).str.strip()
+    news_df["item_genres"] = news_df["category"].fillna("").apply(_normalize_token_block)
+    news_df["item_tags"] = news_df["subcategory"].fillna("").apply(
+        _normalize_token_block
+    )
+    news_df["text_len"] = news_df["item_text"].str.split().apply(len).astype(int)
+    news_df = news_df.rename(columns={"news_id": "item_id"})
+
+    behavior_columns = [
+        "impression_id",
+        "user_id",
+        "timestamp",
+        "history",
+        "impressions",
+    ]
+    behaviors = pd.read_csv(
+        behaviors_path,
+        sep="\t",
+        header=None,
+        names=behavior_columns,
+        quoting=csv.QUOTE_NONE,
+        on_bad_lines="skip",
+        encoding="utf-8",
+        engine="python",
+    )
+    behaviors["timestamp"] = pd.to_datetime(
+        behaviors["timestamp"],
+        format=_MSNEWS_TIMESTAMP_FORMAT,
+        errors="coerce",
+    )
+    behaviors = behaviors.dropna(subset=["timestamp"])
+    behaviors["timestamp"] = (
+        behaviors["timestamp"].astype("int64") // 1_000_000_000
+    ).astype("int64")
+    behaviors["user_id"] = behaviors["user_id"].astype(str)
+
+    interaction_rows: list[tuple[str, str, int]] = []
+    for row in behaviors.itertuples(index=False):
+        clicked = _extract_msnews_clicked(row.impressions)
+        if not clicked:
+            continue
+        for item_id in clicked:
+            interaction_rows.append((row.user_id, item_id, int(row.timestamp)))
+    if not interaction_rows:
+        raise RuntimeError(
+            f"No clicks parsed from Microsoft News behaviors at {behaviors_path}"
+        )
+    interactions = pd.DataFrame(
+        interaction_rows, columns=["user_id", "item_id", "timestamp"]
+    )
+    interactions["rating_or_y"] = 1.0
+
+    merged = interactions.merge(
+        news_df[["item_id", "item_text", "item_genres", "item_tags", "text_len"]],
+        on="item_id",
+        how="left",
+    )
+    merged["item_text"] = merged["item_text"].fillna("")
+    merged["item_genres"] = merged["item_genres"].fillna("")
+    merged["item_tags"] = merged["item_tags"].fillna("")
+    merged["text_len"] = merged["text_len"].fillna(0).astype(int)
+    merged["release_year"] = -1
+    merged["release_ts"] = -1
+    merged["timestamp"] = merged["timestamp"].astype(int)
+    merged["rating_or_y"] = merged["rating_or_y"].astype(float)
+    return merged[
+        [
+            "user_id",
+            "item_id",
+            "rating_or_y",
+            "timestamp",
+            "item_text",
+            "item_genres",
+            "item_tags",
+            "release_year",
+            "release_ts",
+            "text_len",
+        ]
+    ]
+
+
 __all__ = [
     "_read_simple_yaml",
     "build_interaction_frame",
     "build_amazon_interaction_frame",
     "build_goodreads_interaction_frame",
+    "build_msnews_interaction_frame",
     "MOVIELENS_SMALL_URL",
     "MOVIELENS_MEDIUM_URL",
     "AMAZON_DATASETS",
     "GOODREADS_GENRES",
+    "MSNEWS_VARIANTS",
 ]
