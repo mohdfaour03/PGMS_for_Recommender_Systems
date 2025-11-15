@@ -639,7 +639,15 @@ def _ensure_msnews_resources(variant: str, cache_dir: Path) -> tuple[Path, Path]
     cache_dir.mkdir(parents=True, exist_ok=True)
     info = _MSNEWS_VARIANTS[variant]
     zip_path = cache_dir / info["zip_name"]
-    _download_file_with_mirrors(zip_path, [info["url"]])
+    if not zip_path.exists():
+        try:
+            _download_file_with_mirrors(zip_path, [info["url"]])
+        except Exception as err:
+            raise RuntimeError(
+                "Microsoft News (MIND) downloads require accepting Microsoft's license. "
+                f"Download {info['zip_name']} manually from https://msnews.github.io/ "
+                f"and place it under {zip_path.parent} before re-running the notebook."
+            ) from err
     extract_root = cache_dir / info["folder"]
     news_path = extract_root / "news.tsv"
     behaviors_path = extract_root / "behaviors.tsv"
