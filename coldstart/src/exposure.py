@@ -261,18 +261,24 @@ def train_exposure_model(
     
     device = _device(config.prefer_gpu)
     
+    # Reduce batch size for faster iteration
+    batch_size = min(512, max(32, config.batch_size))
+    print(f"[Exposure] Creating DataLoader (batch_size={batch_size})...")
+    
     loader = torch.utils.data.DataLoader(
         dataset,
-        batch_size=max(32, config.batch_size),
+        batch_size=batch_size,
         shuffle=True,
         drop_last=False,
-        num_workers=0, # Keep 0 to avoid pickling overhead of the large builder/dataset
+        num_workers=0,
     )
 
+    print(f"[Exposure] Initializing model on {device}...")
     model = _ExposureMLP(builder.feature_dim, config.hidden_dim).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
     criterion = nn.BCELoss()
 
+    print(f"[Exposure] Starting training ({config.epochs} epochs)...")
     for epoch in range(config.epochs):
         epoch_loss = 0.0
         batches = 0
@@ -286,8 +292,13 @@ def train_exposure_model(
             optimizer.step()
             epoch_loss += float(loss.detach().cpu())
             batches += 1
+            
+            # Print progress every 100 batches
+            if batches % 100 == 0:
+                print(f"[Exposure] Epoch {epoch+1}/{config.epochs}, batch {batches}, loss={loss.item():.4f}")
+        
         avg_loss = epoch_loss / max(1, batches)
-        print(f"[Exposure] epoch {epoch + 1}/{config.epochs} - loss={avg_loss:.4f}")
+        print(f"[Exposure] Epoch {epoch + 1}/{config.epochs} - loss={avg_loss:.4f}, batches={batches}")
 
     pi_lookup = builder.compute_pi_lookup(model, device)
     checkpoint = {
