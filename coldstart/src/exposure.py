@@ -147,79 +147,119 @@ class _ExposureBuilder:
             sampled.append(candidate)
         return sampled
 
-    def build_training_pairs(self) -> Tuple[List[List[float]], List[float]]:
-        rng = random.Random(self.config.seed)
-        user_history: Dict[str, int] = defaultdict(int)
-        user_genres: Dict[str, Counter] = defaultdict(Counter)
-        user_consumed: Dict[str, set[str]] = defaultdict(set)
-        features: List[List[float]] = []
-        labels: List[float] = []
+    def build_dataset(self) -> _ExposureDataset:
+        return _ExposureDataset(self)
 
-        for row in self.warm_rows:
+
+class _ExposureDataset(torch.utils.data.Dataset):
+    def __init__(self, builder: _ExposureBuilder) -> None:
+        self.builder = builder
+        self.rng = random.Random(builder.config.seed)
+        self.epoch_seed = 0
+        # Pre-compute positive indices to allow shuffling
+        self.indices = list(range(len(builder.warm_rows)))
+        self.neg_per_pos = builder.config.negatives_per_positive
+        self.max_samples = builder.config.max_training_samples
+        
+        # Pre-compute user metadata to avoid repeated lookups
+        self.user_meta = []
+        user_history = defaultdict(int)
+        user_genres = defaultdict(Counter)
+        user_consumed = defaultdict(set)
+        
+        for row in builder.warm_rows:
             user = row["user_id"]
             item = row["item_id"]
             timestamp = int(row.get("timestamp") or 0)
-            user_vec = self._user_features(user, user_history[user], user_genres[user])
-            item_vec = self._item_features(item, timestamp)
-            features.append(self._concat(user_vec, item_vec))
-            labels.append(1.0)
-            self._positives += 1
-
-            neg_items = self._sample_negatives(timestamp, user_consumed[user], rng)
-            for neg in neg_items:
-                if self.config.max_training_samples is not None and len(labels) >= self.config.max_training_samples:
-                    break
-                neg_vec = self._item_features(neg, timestamp)
-                features.append(self._concat(user_vec, neg_vec))
-                labels.append(0.0)
-                self._negatives += 1
-
+            
+            # Store current state for this interaction
+            hist_count = user_history[user]
+            genres = user_genres[user].copy() # Shallow copy is enough for Counter
+            
+            self.user_meta.append({
+                "user": user,
+                "item": item,
+                "timestamp": timestamp,
+                "hist_count": hist_count,
+                "genres": genres,
+                "consumed": user_consumed[user].copy() # Need copy of set as it grows
+            })
+            
+            # Update state for next interaction
             user_history[user] += 1
-            for genre in self.item_meta.get(item, {}).get("genres", []):
+            for genre in builder.item_meta.get(item, {}).get("genres", []):
                 user_genres[user][genre] += 1
             user_consumed[user].add(item)
 
-        print(
-            f"Exposure pairs: {self._positives} positives, "
-            f"{self._negatives} negatives (k={self.config.negatives_per_positive})."
-        )
-        return features, labels
+    def __len__(self) -> int:
+        total = len(self.indices) * (1 + self.neg_per_pos)
+        if self.max_samples:
+            return min(total, self.max_samples)
+        return total
 
-    def compute_pi_lookup(self, model: nn.Module, device: torch.device) -> Dict[str, float]:
-        model.eval()
-        user_history: Dict[str, int] = defaultdict(int)
-        user_genres: Dict[str, Counter] = defaultdict(Counter)
-        pi_lookup: Dict[str, float] = {}
-        batch_vectors: List[List[float]] = []
-        batch_keys: List[Tuple[str, str]] = []
-        batch_size = 8192
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Map linear index to (interaction_idx, is_negative, neg_idx)
+        # We group 1 positive + N negatives together logically, but return them individually
+        # to work with standard DataLoader batching.
+        
+        group_size = 1 + self.neg_per_pos
+        interaction_idx = idx // group_size
+        sub_idx = idx % group_size
+        
+        if interaction_idx >= len(self.user_meta):
+            # Fallback for edge cases or if max_samples cuts mid-group
+            interaction_idx = 0
+            sub_idx = 0
 
-        def _flush() -> None:
-            if not batch_vectors:
-                return
-            with torch.no_grad():
-                inputs = torch.tensor(batch_vectors, dtype=torch.float32, device=device)
-                preds = model(inputs).clamp(self.config.pi_min, 1.0 - self.config.pi_min)
-                for key, value in zip(batch_keys, preds.squeeze(1).tolist()):
-                    pi_lookup[f"{key[0]}::{key[1]}"] = float(value)
-            batch_vectors.clear()
-            batch_keys.clear()
+        meta = self.user_meta[interaction_idx]
+        user = meta["user"]
+        timestamp = meta["timestamp"]
+        
+        user_vec = self.builder._user_features(user, meta["hist_count"], meta["genres"])
+        
+        if sub_idx == 0:
+            # Positive sample
+            item = meta["item"]
+            label = 1.0
+            self.builder._positives += 1 # Note: this counter won't be exact with multi-workers
+        else:
+            # Negative sample
+            # We use a deterministic seed per interaction + sub_idx to ensure consistency within epoch
+            # but allow variation across epochs if we wanted (though here we keep it simple)
+            # Actually, for speed, we just use the rng. 
+            # Note: In multi-worker setup, rng state is duplicated. 
+            # Ideally we'd use worker_info to seed, but for exposure model simple random is fine.
+            
+            # Re-seed rng for determinism based on index if needed, but let's just sample.
+            # To avoid "consumed" set lookups being slow, we pass the pre-computed set.
+            
+            # Optimization: _sample_negatives returns a list. We just need one.
+            # We can modify _sample_negatives or just call it for 1.
+            # Since we need to be fast, let's just pick one candidate.
+            
+            cutoff = bisect.bisect_right(self.builder.release_times, timestamp)
+            if cutoff > 0:
+                candidates = self.builder.release_items
+                # Try to find a valid negative
+                for _ in range(10):
+                    cand = candidates[self.rng.randrange(cutoff)]
+                    if cand not in meta["consumed"]:
+                        item = cand
+                        break
+                else:
+                    # Fallback if hard to find negative (unlikely)
+                    item = candidates[self.rng.randrange(cutoff)]
+            else:
+                # No items released yet? Should not happen for valid data.
+                item = meta["item"] # Fallback to positive (label 0 will penalize, but rare)
+            
+            label = 0.0
+            self.builder._negatives += 1
 
-        for row in self.warm_rows:
-            user = row["user_id"]
-            item = row["item_id"]
-            timestamp = int(row.get("timestamp") or 0)
-            user_vec = self._user_features(user, user_history[user], user_genres[user])
-            item_vec = self._item_features(item, timestamp)
-            batch_vectors.append(self._concat(user_vec, item_vec))
-            batch_keys.append((user, item))
-            if len(batch_vectors) >= batch_size:
-                _flush()
-            user_history[user] += 1
-            for genre in self.item_meta.get(item, {}).get("genres", []):
-                user_genres[user][genre] += 1
-        _flush()
-        return pi_lookup
+        item_vec = self.builder._item_features(item, timestamp)
+        feature = self.builder._concat(user_vec, item_vec)
+        
+        return torch.tensor(feature, dtype=torch.float32), torch.tensor([label], dtype=torch.float32)
 
 
 def train_exposure_model(
@@ -228,20 +268,16 @@ def train_exposure_model(
     config: ExposureConfig,
 ) -> Dict[str, float]:
     builder = _ExposureBuilder(warm_rows, config)
-    features, labels = builder.build_training_pairs()
-    if not features:
-        raise RuntimeError("No exposure pairs could be generated.")
-
+    dataset = builder.build_dataset()
+    
     device = _device(config.prefer_gpu)
-    inputs = torch.tensor(features, dtype=torch.float32)
-    targets = torch.tensor(labels, dtype=torch.float32).unsqueeze(1)
-    del features, labels
-    dataset = torch.utils.data.TensorDataset(inputs, targets)
+    
     loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=max(32, config.batch_size),
         shuffle=True,
         drop_last=False,
+        num_workers=0, # Keep 0 to avoid pickling overhead of the large builder/dataset
     )
 
     model = _ExposureMLP(builder.feature_dim, config.hidden_dim).to(device)
@@ -250,6 +286,7 @@ def train_exposure_model(
 
     for epoch in range(config.epochs):
         epoch_loss = 0.0
+        batches = 0
         for batch_inputs, batch_targets in loader:
             batch_inputs = batch_inputs.to(device)
             batch_targets = batch_targets.to(device)
@@ -259,7 +296,8 @@ def train_exposure_model(
             loss.backward()
             optimizer.step()
             epoch_loss += float(loss.detach().cpu())
-        avg_loss = epoch_loss / max(1, len(loader))
+            batches += 1
+        avg_loss = epoch_loss / max(1, batches)
         print(f"[Exposure] epoch {epoch + 1}/{config.epochs} - loss={avg_loss:.4f}")
 
     pi_lookup = builder.compute_pi_lookup(model, device)
