@@ -156,25 +156,28 @@ class _ExposureDataset(torch.utils.data.Dataset):
         self.builder = builder
         self.rng = random.Random(builder.config.seed)
         self.epoch_seed = 0
-        # Pre-compute positive indices to allow shuffling
         self.indices = list(range(len(builder.warm_rows)))
         self.neg_per_pos = builder.config.negatives_per_positive
         self.max_samples = builder.config.max_training_samples
         
-        # Pre-compute user metadata to avoid repeated lookups
         self.user_meta = []
         user_history = defaultdict(int)
         user_genres = defaultdict(Counter)
-        user_consumed = defaultdict(set)
+        
+        # Pre-compute full consumed sets for each user to avoid copying sets per row
+        # This changes semantics slightly (negatives cannot be future positives), 
+        # but this is generally desirable or acceptable and saves massive memory.
+        self.user_consumed = defaultdict(set)
+        for row in builder.warm_rows:
+            self.user_consumed[row["user_id"]].add(row["item_id"])
         
         for row in builder.warm_rows:
             user = row["user_id"]
             item = row["item_id"]
             timestamp = int(row.get("timestamp") or 0)
             
-            # Store current state for this interaction
             hist_count = user_history[user]
-            genres = user_genres[user].copy() # Shallow copy is enough for Counter
+            genres = user_genres[user].copy()
             
             self.user_meta.append({
                 "user": user,
@@ -182,14 +185,12 @@ class _ExposureDataset(torch.utils.data.Dataset):
                 "timestamp": timestamp,
                 "hist_count": hist_count,
                 "genres": genres,
-                "consumed": user_consumed[user].copy() # Need copy of set as it grows
+                # "consumed": removed to save memory
             })
             
-            # Update state for next interaction
             user_history[user] += 1
             for genre in builder.item_meta.get(item, {}).get("genres", []):
                 user_genres[user][genre] += 1
-            user_consumed[user].add(item)
 
     def __len__(self) -> int:
         total = len(self.indices) * (1 + self.neg_per_pos)
@@ -198,16 +199,11 @@ class _ExposureDataset(torch.utils.data.Dataset):
         return total
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Map linear index to (interaction_idx, is_negative, neg_idx)
-        # We group 1 positive + N negatives together logically, but return them individually
-        # to work with standard DataLoader batching.
-        
         group_size = 1 + self.neg_per_pos
         interaction_idx = idx // group_size
         sub_idx = idx % group_size
         
         if interaction_idx >= len(self.user_meta):
-            # Fallback for edge cases or if max_samples cuts mid-group
             interaction_idx = 0
             sub_idx = 0
 
@@ -218,40 +214,23 @@ class _ExposureDataset(torch.utils.data.Dataset):
         user_vec = self.builder._user_features(user, meta["hist_count"], meta["genres"])
         
         if sub_idx == 0:
-            # Positive sample
             item = meta["item"]
             label = 1.0
-            self.builder._positives += 1 # Note: this counter won't be exact with multi-workers
+            self.builder._positives += 1
         else:
-            # Negative sample
-            # We use a deterministic seed per interaction + sub_idx to ensure consistency within epoch
-            # but allow variation across epochs if we wanted (though here we keep it simple)
-            # Actually, for speed, we just use the rng. 
-            # Note: In multi-worker setup, rng state is duplicated. 
-            # Ideally we'd use worker_info to seed, but for exposure model simple random is fine.
-            
-            # Re-seed rng for determinism based on index if needed, but let's just sample.
-            # To avoid "consumed" set lookups being slow, we pass the pre-computed set.
-            
-            # Optimization: _sample_negatives returns a list. We just need one.
-            # We can modify _sample_negatives or just call it for 1.
-            # Since we need to be fast, let's just pick one candidate.
-            
             cutoff = bisect.bisect_right(self.builder.release_times, timestamp)
             if cutoff > 0:
                 candidates = self.builder.release_items
-                # Try to find a valid negative
+                consumed = self.user_consumed[user]
                 for _ in range(10):
                     cand = candidates[self.rng.randrange(cutoff)]
-                    if cand not in meta["consumed"]:
+                    if cand not in consumed:
                         item = cand
                         break
                 else:
-                    # Fallback if hard to find negative (unlikely)
                     item = candidates[self.rng.randrange(cutoff)]
             else:
-                # No items released yet? Should not happen for valid data.
-                item = meta["item"] # Fallback to positive (label 0 will penalize, but rare)
+                item = meta["item"]
             
             label = 0.0
             self.builder._negatives += 1
