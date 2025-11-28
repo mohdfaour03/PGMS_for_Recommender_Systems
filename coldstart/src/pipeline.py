@@ -495,7 +495,11 @@ def train_and_evaluate_content_model(
             metrics["buckets"] = aggregated_buckets
         return metrics
 
+    import gc
+    gc.collect()
+
     for name in requested:
+        print(f"--- Training model: {name} ---")
         if name == "ctrlite":
             if use_torch:
                 ctrlite_batch = max(1, int(mf_cfg.get("ctrlite_batch_size", 2048)))

@@ -68,6 +68,8 @@ def train_mf(
     prefer_gpu: bool = True,
 ) -> Tuple[List[List[float]], List[List[float]], Dict[str, int], Dict[str, int]]:
     """Train matrix factorisation with PyTorch embeddings."""
+    print(f"[MF] Starting training (iters={iters}, batch_size={batch_size}, gpu={prefer_gpu})...")
+    import gc
     _set_seed(seed)
     device = _torch_device(prefer_gpu)
 
@@ -85,7 +87,10 @@ def train_mf(
     optimizer = torch.optim.SGD(model.parameters(), lr=lr)
 
     reg_term = torch.tensor(reg, device=device, dtype=torch.float32)
-    for _ in range(iters):
+    
+    for epoch in range(iters):
+        epoch_loss = 0.0
+        count = 0
         for batch_users, batch_items, batch_ratings in loader:
             batch_users = batch_users.to(device)
             batch_items = batch_items.to(device)
@@ -99,9 +104,20 @@ def train_mf(
             )
             loss.backward()
             optimizer.step()
+            epoch_loss += loss.item()
+            count += 1
+        
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            print(f"[MF] Epoch {epoch+1}/{iters} loss={epoch_loss/max(1, count):.4f}")
 
     U = model.user_emb.weight.detach().cpu().numpy().tolist()
     V = model.item_emb.weight.detach().cpu().numpy().tolist()
+    
+    del model, optimizer, loader, dataset, users, items, ratings
+    if prefer_gpu:
+        torch.cuda.empty_cache()
+    gc.collect()
+    
     return U, V, user_to_idx, item_to_idx
 
 
