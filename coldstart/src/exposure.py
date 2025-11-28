@@ -153,6 +153,7 @@ class _ExposureBuilder:
 
 class _ExposureDataset(torch.utils.data.Dataset):
     def __init__(self, builder: _ExposureBuilder) -> None:
+        print("[Exposure] Initializing dataset...")
         self.builder = builder
         self.rng = random.Random(builder.config.seed)
         self.epoch_seed = 0
@@ -160,24 +161,32 @@ class _ExposureDataset(torch.utils.data.Dataset):
         self.neg_per_pos = builder.config.negatives_per_positive
         self.max_samples = builder.config.max_training_samples
         
+        print(f"[Exposure] Building metadata for {len(builder.warm_rows)} interactions...")
         self.user_meta = []
         user_history = defaultdict(int)
-        user_genres = defaultdict(Counter)
+        # Store genre counts as simple dicts to avoid Counter overhead
+        user_genres_dict = defaultdict(dict)
         
         # Pre-compute full consumed sets for each user to avoid copying sets per row
-        # This changes semantics slightly (negatives cannot be future positives), 
-        # but this is generally desirable or acceptable and saves massive memory.
         self.user_consumed = defaultdict(set)
         for row in builder.warm_rows:
             self.user_consumed[row["user_id"]].add(row["item_id"])
         
-        for row in builder.warm_rows:
+        print("[Exposure] Pre-computed consumed items for all users")
+        
+        # Build user metadata
+        checkpoint_interval = max(1, len(builder.warm_rows) // 10)
+        for idx, row in enumerate(builder.warm_rows):
+            if idx % checkpoint_interval == 0:
+                print(f"[Exposure] Processed {idx}/{len(builder.warm_rows)} interactions...")
+            
             user = row["user_id"]
             item = row["item_id"]
             timestamp = int(row.get("timestamp") or 0)
             
             hist_count = user_history[user]
-            genres = user_genres[user].copy()
+            # Convert dict to Counter only when needed (lazy conversion)
+            genres = Counter(user_genres_dict[user])
             
             self.user_meta.append({
                 "user": user,
@@ -185,12 +194,13 @@ class _ExposureDataset(torch.utils.data.Dataset):
                 "timestamp": timestamp,
                 "hist_count": hist_count,
                 "genres": genres,
-                # "consumed": removed to save memory
             })
             
             user_history[user] += 1
             for genre in builder.item_meta.get(item, {}).get("genres", []):
-                user_genres[user][genre] += 1
+                user_genres_dict[user][genre] = user_genres_dict[user].get(genre, 0) + 1
+        
+        print(f"[Exposure] Dataset ready with {len(self.user_meta)} interaction records")
 
     def __len__(self) -> int:
         total = len(self.indices) * (1 + self.neg_per_pos)
