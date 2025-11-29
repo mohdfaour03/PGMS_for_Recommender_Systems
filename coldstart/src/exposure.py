@@ -191,7 +191,7 @@ class _ExposureBuilder:
 
 class _ExposureDataset(torch.utils.data.Dataset):
     def __init__(self, builder: _ExposureBuilder) -> None:
-        print("[Exposure] Initializing dataset...")
+        print("[Exposure] Initializing dataset (optimized)...")
         self.builder = builder
         self.rng = random.Random(builder.config.seed)
         self.epoch_seed = 0
@@ -199,46 +199,52 @@ class _ExposureDataset(torch.utils.data.Dataset):
         self.neg_per_pos = builder.config.negatives_per_positive
         self.max_samples = builder.config.max_training_samples
         
-        print(f"[Exposure] Building metadata for {len(builder.warm_rows)} interactions...")
-        self.user_meta = []
-        user_history = defaultdict(int)
-        # Store genre counts as simple dicts to avoid Counter overhead
-        user_genres_dict = defaultdict(dict)
+        print(f"[Exposure] Pre-computing all features for {len(builder.warm_rows)} interactions...")
         
-        # Pre-compute full consumed sets for each user to avoid copying sets per row
+        # Pre-compute consumed sets
         self.user_consumed = defaultdict(set)
         for row in builder.warm_rows:
             self.user_consumed[row["user_id"]].add(row["item_id"])
         
-        print("[Exposure] Pre-computed consumed items for all users")
+        # Pre-compute ALL user and item features to avoid overhead in __getitem__
+        user_history = defaultdict(int)
+        user_genre_affinity = defaultdict(lambda: [0.0] * len(builder.genre_vocab))
         
-        # Build user metadata
+        self.precomputed_features = []
         checkpoint_interval = max(1, len(builder.warm_rows) // 10)
+        
         for idx, row in enumerate(builder.warm_rows):
             if idx % checkpoint_interval == 0:
-                print(f"[Exposure] Processed {idx}/{len(builder.warm_rows)} interactions...")
+                print(f"[Exposure] Pre-computed {idx}/{len(builder.warm_rows)} features...")
             
             user = row["user_id"]
             item = row["item_id"]
             timestamp = int(row.get("timestamp") or 0)
             
-            hist_count = user_history[user]
-            # Convert dict to Counter only when needed (lazy conversion)
-            genres = Counter(user_genres_dict[user])
+            # Compute user features NOW
+            user_vec = builder._user_features(user, user_history[user], Counter(dict(zip(builder.genre_vocab, user_genre_affinity[user]))))
+            # Compute item features NOW
+            item_vec = builder._item_features(item, timestamp)
+            # Concatenate NOW
+            pos_feature = builder._concat(user_vec, item_vec)
             
-            self.user_meta.append({
+            self.precomputed_features.append({
                 "user": user,
-                "item": item,
                 "timestamp": timestamp,
-                "hist_count": hist_count,
-                "genres": genres,
+                "pos_feature": pos_feature,
             })
             
+            # Update state for next interaction
             user_history[user] += 1
             for genre in builder.item_meta.get(item, {}).get("genres", []):
-                user_genres_dict[user][genre] = user_genres_dict[user].get(genre, 0) + 1
+                genre_idx = builder.genre_index.get(genre)
+                if genre_idx is not None:
+                    total = sum(user_genre_affinity[user])
+                    if total > 0:
+                        user_genre_affinity[user] = [(count / (total + 1)) for count in user_genre_affinity[user]]
+                    user_genre_affinity[user][genre_idx] += 1.0 / (total + 1)
         
-        print(f"[Exposure] Dataset ready with {len(self.user_meta)} interaction records")
+        print(f"[Exposure] Dataset ready with {len(self.precomputed_features)} pre-computed features")
 
     def __len__(self) -> int:
         total = len(self.indices) * (1 + self.neg_per_pos)
@@ -251,21 +257,21 @@ class _ExposureDataset(torch.utils.data.Dataset):
         interaction_idx = idx // group_size
         sub_idx = idx % group_size
         
-        if interaction_idx >= len(self.user_meta):
+        if interaction_idx >= len(self.precomputed_features):
             interaction_idx = 0
             sub_idx = 0
 
-        meta = self.user_meta[interaction_idx]
-        user = meta["user"]
-        timestamp = meta["timestamp"]
-        
-        user_vec = self.builder._user_features(user, meta["hist_count"], meta["genres"])
+        precomp = self.precomputed_features[interaction_idx]
         
         if sub_idx == 0:
-            item = meta["item"]
+            # Positive sample - use precomputed
+            feature = precomp["pos_feature"]
             label = 1.0
-            self.builder._positives += 1
         else:
+            # Negative sample - only compute item features
+            user = precomp["user"]
+            timestamp = precomp["timestamp"]
+            
             cutoff = bisect.bisect_right(self.builder.release_times, timestamp)
             if cutoff > 0:
                 candidates = self.builder.release_items
@@ -278,13 +284,14 @@ class _ExposureDataset(torch.utils.data.Dataset):
                 else:
                     item = candidates[self.rng.randrange(cutoff)]
             else:
-                item = meta["item"]
+                # Fallback
+                item = self.builder.release_items[0] if self.builder.release_items else "dummy"
             
+            # Use pre-computed user features, just compute neg item
+            item_vec = self.builder._item_features(item, timestamp)
+            user_vec = precomp["pos_feature"][:len(precomp["pos_feature"]) - len(item_vec)]  # Extract user part
+            feature = self.builder._concat(user_vec, item_vec)
             label = 0.0
-            self.builder._negatives += 1
-
-        item_vec = self.builder._item_features(item, timestamp)
-        feature = self.builder._concat(user_vec, item_vec)
         
         return torch.tensor(feature, dtype=torch.float32), torch.tensor([label], dtype=torch.float32)
 
