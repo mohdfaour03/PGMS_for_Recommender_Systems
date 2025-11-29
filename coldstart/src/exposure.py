@@ -147,6 +147,44 @@ class _ExposureBuilder:
             sampled.append(candidate)
         return sampled
 
+    def compute_pi_lookup(self, model: nn.Module, device: torch.device) -> Dict[str, float]:
+        model.eval()
+        user_history: Dict[str, int] = defaultdict(int)
+        user_genres: Dict[str, Counter] = defaultdict(Counter)
+        pi_lookup: Dict[str, float] = {}
+        batch_vectors: List[List[float]] = []
+        batch_keys: List[Tuple[str, str]] = []
+        batch_size = 8192
+
+        def _flush() -> None:
+            if not batch_vectors:
+                return
+            with torch.no_grad():
+                inputs = torch.tensor(batch_vectors, dtype=torch.float32, device=device)
+                preds = model(inputs).clamp(self.config.pi_min, 1.0 - self.config.pi_min)
+                for key, value in zip(batch_keys, preds.squeeze(1).tolist()):
+                    pi_lookup[f"{key[0]}::{key[1]}"] = float(value)
+            batch_vectors.clear()
+            batch_keys.clear()
+
+        print("[Exposure] Computing propensity scores for all interactions...")
+        for row in self.warm_rows:
+            user = row["user_id"]
+            item = row["item_id"]
+            timestamp = int(row.get("timestamp") or 0)
+            user_vec = self._user_features(user, user_history[user], user_genres[user])
+            item_vec = self._item_features(item, timestamp)
+            batch_vectors.append(self._concat(user_vec, item_vec))
+            batch_keys.append((user, item))
+            if len(batch_vectors) >= batch_size:
+                _flush()
+            user_history[user] += 1
+            for genre in self.item_meta.get(item, {}).get("genres", []):
+                user_genres[user][genre] += 1
+        _flush()
+        print(f"[Exposure] Computed {len(pi_lookup)} propensity scores")
+        return pi_lookup
+
     def build_dataset(self) -> _ExposureDataset:
         return _ExposureDataset(self)
 
