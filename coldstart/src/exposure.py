@@ -191,7 +191,7 @@ class _ExposureBuilder:
 
 class _ExposureDataset(torch.utils.data.Dataset):
     def __init__(self, builder: _ExposureBuilder) -> None:
-        print("[Exposure] Initializing dataset (optimized)...")
+        print("[Exposure] Initializing dataset (user-level cache)...")
         self.builder = builder
         self.rng = random.Random(builder.config.seed)
         self.epoch_seed = 0
@@ -199,52 +199,52 @@ class _ExposureDataset(torch.utils.data.Dataset):
         self.neg_per_pos = builder.config.negatives_per_positive
         self.max_samples = builder.config.max_training_samples
         
-        print(f"[Exposure] Pre-computing all features for {len(builder.warm_rows)} interactions...")
+        print(f"[Exposure] Pre-computing user features and metadata...")
         
         # Pre-compute consumed sets
         self.user_consumed = defaultdict(set)
         for row in builder.warm_rows:
             self.user_consumed[row["user_id"]].add(row["item_id"])
         
-        # Pre-compute ALL user and item features to avoid overhead in __getitem__
+        # Build interaction index with minimal data
+        self.interactions = []
         user_history = defaultdict(int)
-        user_genre_affinity = defaultdict(lambda: [0.0] * len(builder.genre_vocab))
         
-        self.precomputed_features = []
-        checkpoint_interval = max(1, len(builder.warm_rows) // 10)
+        # Track user states at each interaction for feature caching
+        user_feature_cache = {}  # {(user_id, hist_count): feature_vector}
+        user_genre_counts = defaultdict(lambda: [0] * len(builder.genre_vocab))
         
         for idx, row in enumerate(builder.warm_rows):
-            if idx % checkpoint_interval == 0:
-                print(f"[Exposure] Pre-computed {idx}/{len(builder.warm_rows)} features...")
-            
             user = row["user_id"]
             item = row["item_id"]
             timestamp = int(row.get("timestamp") or 0)
+            hist_count = user_history[user]
             
-            # Compute user features NOW
-            user_vec = builder._user_features(user, user_history[user], Counter(dict(zip(builder.genre_vocab, user_genre_affinity[user]))))
-            # Compute item features NOW
-            item_vec = builder._item_features(item, timestamp)
-            # Concatenate NOW
-            pos_feature = builder._concat(user_vec, item_vec)
+            # Cache key for this user state
+            cache_key = (user, hist_count)
+            if cache_key not in user_feature_cache:
+                # Compute and cache user features for this state
+                genre_dict = {builder.genre_vocab[i]: user_genre_counts[user][i] 
+                             for i in range(len(builder.genre_vocab)) if user_genre_counts[user][i] > 0}
+                user_vec = builder._user_features(user, hist_count, Counter(genre_dict))
+                user_feature_cache[cache_key] = user_vec
             
-            self.precomputed_features.append({
+            self.interactions.append({
                 "user": user,
+                "item": item,
                 "timestamp": timestamp,
-                "pos_feature": pos_feature,
+                "cache_key": cache_key,
             })
             
-            # Update state for next interaction
+            # Update for next interaction
             user_history[user] += 1
             for genre in builder.item_meta.get(item, {}).get("genres", []):
                 genre_idx = builder.genre_index.get(genre)
                 if genre_idx is not None:
-                    total = sum(user_genre_affinity[user])
-                    if total > 0:
-                        user_genre_affinity[user] = [(count / (total + 1)) for count in user_genre_affinity[user]]
-                    user_genre_affinity[user][genre_idx] += 1.0 / (total + 1)
+                    user_genre_counts[user][genre_idx] += 1
         
-        print(f"[Exposure] Dataset ready with {len(self.precomputed_features)} pre-computed features")
+        self.user_feature_cache = user_feature_cache
+        print(f"[Exposure] Cached {len(user_feature_cache)} unique user states for {len(self.interactions)} interactions")
 
     def __len__(self) -> int:
         total = len(self.indices) * (1 + self.neg_per_pos)
@@ -257,21 +257,24 @@ class _ExposureDataset(torch.utils.data.Dataset):
         interaction_idx = idx // group_size
         sub_idx = idx % group_size
         
-        if interaction_idx >= len(self.precomputed_features):
+        if interaction_idx >= len(self.interactions):
             interaction_idx = 0
             sub_idx = 0
 
-        precomp = self.precomputed_features[interaction_idx]
+        interaction = self.interactions[interaction_idx]
+        user = interaction["user"]
+        item = interaction["item"]
+        timestamp = interaction["timestamp"]
+        
+        # Use cached user features
+        user_vec = self.user_feature_cache[interaction["cache_key"]]
         
         if sub_idx == 0:
-            # Positive sample - use precomputed
-            feature = precomp["pos_feature"]
+            # Positive sample
+            item_vec = self.builder._item_features(item, timestamp)
             label = 1.0
         else:
-            # Negative sample - only compute item features
-            user = precomp["user"]
-            timestamp = precomp["timestamp"]
-            
+            # Negative sample
             cutoff = bisect.bisect_right(self.builder.release_times, timestamp)
             if cutoff > 0:
                 candidates = self.builder.release_items
@@ -279,20 +282,17 @@ class _ExposureDataset(torch.utils.data.Dataset):
                 for _ in range(10):
                     cand = candidates[self.rng.randrange(cutoff)]
                     if cand not in consumed:
-                        item = cand
+                        neg_item = cand
                         break
                 else:
-                    item = candidates[self.rng.randrange(cutoff)]
+                    neg_item = candidates[self.rng.randrange(cutoff)]
             else:
-                # Fallback
-                item = self.builder.release_items[0] if self.builder.release_items else "dummy"
+                neg_item = self.builder.release_items[0] if self.builder.release_items else item
             
-            # Use pre-computed user features, just compute neg item
-            item_vec = self.builder._item_features(item, timestamp)
-            user_vec = precomp["pos_feature"][:len(precomp["pos_feature"]) - len(item_vec)]  # Extract user part
-            feature = self.builder._concat(user_vec, item_vec)
+            item_vec = self.builder._item_features(neg_item, timestamp)
             label = 0.0
         
+        feature = self.builder._concat(user_vec, item_vec)
         return torch.tensor(feature, dtype=torch.float32), torch.tensor([label], dtype=torch.float32)
 
 
